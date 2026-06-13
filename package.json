@@ -1,0 +1,28 @@
+{
+  "name": "tb-automation-ts",
+  "version": "1.0.0",
+  "description": "ThingsBoard Automation, Simulator and Gemini Live Agent in TypeScript",
+  "main": "dist/liveAgent.js",
+  "scripts": {
+    "build": "tsc",
+    "simulator": "ts-node src/simulator.ts",
+    "agent": "ts-node src/liveAgent.ts",
+    "start:simulator": "node dist/simulator.js",
+    "start:agent": "node dist/liveAgent.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.8.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mqtt": "^5.10.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

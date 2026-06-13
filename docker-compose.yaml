@@ -1,0 +1,78 @@
+services:
+  postgres:
+    restart: always
+    image: "postgres:17-alpine"
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: thingsboard
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d thingsboard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - tb-network
+
+  thingsboard-ce:
+    restart: always
+    image: "thingsboard/tb-node:4.3.1.2"
+    ports:
+      - "8080:8080"
+      - "7070:7070"
+      - "1883:1883"
+      - "8883:8883"
+      - "5683-5688:5683-5688/udp"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+    environment:
+      TB_SERVICE_ID: tb-ce-node
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/thingsboard
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tb-network
+
+  iot-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "9001:9001"
+    environment:
+      # Use internal Docker service name for connection routing
+      THINGSBOARD_MQTT_HOST: thingsboard-ce
+      THINGSBOARD_MQTT_PORT: 1883
+      SIMULATION_INTERVAL_SECONDS: 15
+      SENSOR_01_TOKEN: "your_sensor_01_token" # Replace with actual token from TB UI
+      SENSOR_02_TOKEN: "your_sensor_02_token" # Replace with actual token from TB UI
+    volumes:
+      - ./reports:/usr/src/app/reports        # Maps output HTML reports back to your local host folder
+    depends_on:
+      thingsboard-ce:
+        condition: service_started
+    networks:
+      - tb-network
+
+volumes:
+  postgres-data:
+    name: tb-postgres-data
+    driver: local
+
+networks:
+  tb-network:
+    driver: bridge
