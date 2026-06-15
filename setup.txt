@@ -1,0 +1,94 @@
+You must initialize the database and install the ThingsBoard schema before the first run.
+
+   1. Start the Database:
+   1     docker compose up -d postgres
+   2. Install ThingsBoard Schema (Wait 10s after step 1):
+
+   1     docker compose run --rm -e INSTALL_TB=true -e LOAD_DEMO=true thingsboard-ce
+      Wait until you see "ThingsBoard installation successfully completed!"
+   3. Launch ThingsBoard:
+   1     docker compose up -d thingsboard-ce
+
+Start the Backend Supervisor
+  Open a terminal in the root folder:
+
+   1 # Install dependencies
+   2 npm install
+   3
+   4 # Start the AI Agent & Simulator
+   5 npm run dev:agent
+  This will auto-provision your devices and connect to the Gemini Live session.
+
+Start the Frontend Dashboard
+  Open a second terminal in the frontend directory:
+
+   1 cd frontend
+   2
+   3 # Install dependencies
+   4 npm install
+   5
+   6 # Start the Vite development server
+   7 npm run dev
+
+Access the Application
+   * AI Dashboard: http://localhost:3000 (http://localhost:3000) (Interact with "Zephyr" here).
+   * ThingsBoard UI: http://localhost:8080 (http://localhost:8080) (Login: tenant@thingsboard.org / tenant).
+   * Simulator Control: http://localhost:9005 (http://localhost:9005) (Internal API port for telemetry).
+  Useful Troubleshooting Commands
+   * Trigger Anomaly: curl -X POST http://localhost:9005/simulation/start_all (Starts telemetry flow).
+   * Check Logs: docker compose logs -f thingsboard-ce (If the UI isn't loading).
+
+
+
+
+Step 1: Start the Infrastructure (Docker)
+  Run this command to start only the database and ThingsBoard core. This keeps your machine's resources free for your code:
+   1 docker compose up -d postgres thingsboard-ce
+
+  ---
+
+  Step 2: Start the Backend (Manual)
+  Open a terminal in the root directory and run:
+   1. Configure .env: Ensure your host settings point to localhost:
+
+   1     THINGSBOARD_HOST=http://localhost:8080
+   2     THINGSBOARD_MQTT_HOST=localhost
+   3     PORT=9005
+   4     GEMINI_API_KEY=your_key_here
+   2. Launch:
+
+   1     npm run dev:agent
+
+  ---
+
+  Step 3: Start the Frontend (Manual)
+  Open a second terminal in the frontend directory and run:
+   1 cd frontend
+   2 npm run dev
+
+  ---
+
+  Step 4: Stop Everything
+  When you are done working:
+   1. Stop Backend/Frontend: Press Ctrl + C in both manual terminals.
+   2. Stop Containers: Run this in the root directory:
+
+   1     docker compose down
+
+
+ 
+Suggested Next Steps for Improvement
+Now that the codebase is consolidated, stable, and the primary latency bottlenecks are resolved, here are three solid directions we can pursue next:
+Option A: Dynamic Simulation Control (Interactive Testing)
+What it is: Create API endpoints and a tool mapping that allows the voice assistant to change the simulated values (e.g., "Zephyr, spike the temperature on Sensor-01 to 90 degrees").
+Why it helps: This provides an end-to-end mechanism to test threshold conditions, rule engines, and voice-triggered alarms without needing physical hardware.
+Option B: Dynamic Dashboard Widgets
+What it is: Enhance the structured createDeviceDashboard tool to support multiple widget types (such as radial gauges for vibration, thermometers for temperature, and interactive state indicators for alarms).
+Why it helps: It aligns the generated dashboards more closely with production-grade ThingsBoard layouts, providing operators with a functional UI.
+Option C: Audio Buffer Smoothing and Jitter Handling
+What it is: Implement a simple jitter-buffer queue for the raw binary PCM audio payload pipeline.
+Why it helps: It helps prevent audio clipping and stuttering if client-side network latency fluctuates during high-traffic voice exchanges.
+Which of these features or areas would you like to build out first?
+
+Observation & Next Steps
+  The Device and Alarm tools are now very "deep." However, the Asset and Rule Chain tools are still using the "simple" implementation (name and type only).

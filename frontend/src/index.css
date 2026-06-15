@@ -1,8 +1,8 @@
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   color-scheme: dark;
-  background-color: #0b0f19;
-  color: #e2e8f0;
+  background-color: #020617; /* Deeper midnight blue */
+  color: #f8fafc;
 }
 
 body {
@@ -10,42 +10,85 @@ body {
   padding: 0;
   box-sizing: border-box;
   overflow-x: hidden;
+  background: radial-gradient(circle at top right, #1e293b, #020617);
+  background-attachment: fixed;
 }
 
-/* Glass Card styling */
+/* Glass Card styling - Refined for "Industrial" look */
 .glass-card {
-  background: rgba(17, 24, 39, 0.7);
-  backdrop-filter: blur(12px);
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  padding: 20px;
-  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.glass-card:hover {
+  border-color: rgba(16, 185, 129, 0.3);
 }
 
 .terminal-box {
-  background: #020617;
+  background: #000000;
   border: 1px solid #1e293b;
-  border-radius: 8px;
-  font-family: "Courier New", Courier, monospace;
+  border-radius: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.6);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
 }
 
 /* Glowing Animations */
 @keyframes pulseGlow {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-  70% { transform: scale(1.08); box-shadow: 0 0 0 15px rgba(16, 185, 129, 0); }
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+  70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
   100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
 @keyframes pulseRecord {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
-  70% { transform: scale(1.08); box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
-  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+  0% { transform: scale(1); filter: brightness(1); }
+  50% { transform: scale(1.1); filter: brightness(1.3); box-shadow: 0 0 20px rgba(239, 68, 68, 0.5); }
+  100% { transform: scale(1); filter: brightness(1); }
 }
 
 .glow-active {
-  animation: pulseGlow 2s infinite;
+  animation: pulseGlow 3s infinite;
 }
 
 .glow-record {
-  animation: pulseRecord 1.5s infinite;
+  animation: pulseRecord 1s infinite cubic-bezier(0.4, 0, 0.6, 1);
 }
+
+/* Custom table styles */
+.industrial-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0 8px;
+}
+
+.industrial-table tr {
+  background: rgba(30, 41, 59, 0.3);
+  border-radius: 8px;
+}
+
+.industrial-table td, .industrial-table th {
+  padding: 12px 16px;
+}
+
+.industrial-table tr td:first-child { border-top-left-radius: 8px; border-bottom-left-radius: 8px; }
+.industrial-table tr td:last-child { border-top-right-radius: 8px; border-bottom-right-radius: 8px; }

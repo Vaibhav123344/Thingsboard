@@ -1,0 +1,17 @@
+# Explicitly point to the PyTorch CUDA 12.1 wheel repository to guarantee GPU binaries
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core Deep Learning Framework (GPU Enabled)
+torch>=2.3.0
+
+# TimesFM Engine with Torch specific dependencies
+timesfm[torch]>=2.0.1
+
+# High-Performance Async Web Server Stack
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+
+# Data Engineering and Processing Utilities
+pandas>=2.2.0
+numpy>=1.26.0
