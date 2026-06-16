@@ -32,13 +32,18 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ThingsBoardRESTBridge = void 0;
 // bridge.ts
 const fs_1 = require("fs");
 const path = __importStar(require("path"));
+const axios_1 = __importDefault(require("axios"));
 const restClient_1 = require("./restClient");
 const services_1 = require("./services");
+const NEGATIVE_CACHE_TTL_MS = 60 * 1000; // 60 seconds
 class ThingsBoardRESTBridge {
     client;
     deviceSrv;
@@ -51,7 +56,7 @@ class ThingsBoardRESTBridge {
     profileSrv;
     rpcSrv;
     auditSrv;
-    // Supports caching negative searches to protect against network spam
+    // Supports caching with TTL for negative lookups
     deviceCache = {};
     assetCache = {};
     fallbackThresholds = {
@@ -87,39 +92,53 @@ class ThingsBoardRESTBridge {
         }
     }
     async getDeviceId(deviceName) {
-        if (this.deviceCache[deviceName] !== undefined) {
-            return this.deviceCache[deviceName];
+        const cached = this.deviceCache[deviceName];
+        if (cached !== undefined) {
+            // If positive cache, return immediately
+            if (cached.value !== null)
+                return cached.value;
+            // If negative cache, check TTL
+            if (Date.now() < cached.expiresAt)
+                return null;
+            // TTL expired, re-query
+            delete this.deviceCache[deviceName];
         }
         try {
             const res = await this.client.request('GET', '/api/tenant/device', { deviceName });
             if (res && res.id) {
                 const devId = res.id.id;
-                this.deviceCache[deviceName] = devId;
+                this.deviceCache[deviceName] = { value: devId, expiresAt: 0 };
                 return devId;
             }
         }
         catch (err) {
             console.warn(`[Bridge Cache] Resolve device failed for '${deviceName}': ${err.message}`);
         }
-        this.deviceCache[deviceName] = null; // Negative caching [2.3.1]
+        // Negative cache with TTL
+        this.deviceCache[deviceName] = { value: null, expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS };
         return null;
     }
     async getAssetId(assetName) {
-        if (this.assetCache[assetName] !== undefined) {
-            return this.assetCache[assetName];
+        const cached = this.assetCache[assetName];
+        if (cached !== undefined) {
+            if (cached.value !== null)
+                return cached.value;
+            if (Date.now() < cached.expiresAt)
+                return null;
+            delete this.assetCache[assetName];
         }
         try {
             const res = await this.client.request('GET', '/api/tenant/asset', { assetName });
             if (res && res.id) {
                 const assetId = res.id.id;
-                this.assetCache[assetName] = assetId;
+                this.assetCache[assetName] = { value: assetId, expiresAt: 0 };
                 return assetId;
             }
         }
         catch (err) {
             console.warn(`[Bridge Cache] Resolve asset failed for '${assetName}': ${err.message}`);
         }
-        this.assetCache[assetName] = null; // Negative caching [2.3.1]
+        this.assetCache[assetName] = { value: null, expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS };
         return null;
     }
     async resolveEntityIdAndType(name) {
@@ -130,6 +149,23 @@ class ThingsBoardRESTBridge {
         if (assetId)
             return { id: assetId, type: 'ASSET' };
         return null;
+    }
+    // Safe min/max that won't blow the call stack on large arrays
+    safeMin(arr) {
+        let min = arr[0];
+        for (let i = 1; i < arr.length; i++) {
+            if (arr[i] < min)
+                min = arr[i];
+        }
+        return min;
+    }
+    safeMax(arr) {
+        let max = arr[0];
+        for (let i = 1; i < arr.length; i++) {
+            if (arr[i] > max)
+                max = arr[i];
+        }
+        return max;
     }
     // Tool 1: list_devices
     async listDevices() {
@@ -191,8 +227,8 @@ class ThingsBoardRESTBridge {
                     const sum = vals.reduce((a, b) => a + b, 0);
                     result[key] = {
                         avg: parseFloat((sum / vals.length).toFixed(2)),
-                        min: parseFloat(Math.min(...vals).toFixed(2)),
-                        max: parseFloat(Math.max(...vals).toFixed(2)),
+                        min: parseFloat(this.safeMin(vals).toFixed(2)),
+                        max: parseFloat(this.safeMax(vals).toFixed(2)),
                     };
                 }
             }
@@ -203,7 +239,7 @@ class ThingsBoardRESTBridge {
             return {};
         }
     }
-    // Tool 4: get_active_alarms (Optimized: O(1) Global Query replaces loop cascade)
+    // Tool 4: get_active_alarms (O(1) Global Query)
     async getActiveAlarms() {
         try {
             const result = await this.alarmSrv.getTenantAlarms(50, 0, undefined, 'ACTIVE');
@@ -258,16 +294,19 @@ class ThingsBoardRESTBridge {
             return {};
         }
     }
-    // Tool 6: get_highest_metric
+    // Tool 6: get_highest_metric — parallelized with Promise.allSettled
     async getHighestMetric(metric) {
-        let highestVal = -Infinity;
-        let highestDev = null;
         try {
             const devices = await this.listDevices();
-            for (const dev of devices) {
+            const results = await Promise.allSettled(devices.map(async (dev) => {
                 const latest = await this.getLatestTelemetry(dev);
-                if (latest[metric] !== undefined) {
-                    const val = latest[metric];
+                return { dev, val: latest[metric] };
+            }));
+            let highestVal = -Infinity;
+            let highestDev = null;
+            for (const result of results) {
+                if (result.status === 'fulfilled') {
+                    const { dev, val } = result.value;
                     if (typeof val === 'number' && val > highestVal) {
                         highestVal = val;
                         highestDev = dev;
@@ -330,7 +369,7 @@ class ThingsBoardRESTBridge {
         }
         return thresholds;
     }
-    // Tool 8: perform_deep_analysis (Asynchronous File System Integration) [2.3.1]
+    // Tool 8: perform_deep_analysis — now processes ALL dynamic telemetry keys
     async performDeepAnalysis(deviceName, startTime, endTime, hours = 24) {
         let startTs;
         let endTs;
@@ -348,7 +387,9 @@ class ThingsBoardRESTBridge {
         const thresholds = await this.getDeviceThresholds(deviceName);
         // Fetch dynamic telemetry keys
         const latest = await this.getLatestTelemetry(deviceName);
-        const keysStr = Object.keys(latest).join(',') || Object.keys(this.fallbackThresholds).join(',');
+        const dynamicKeys = Object.keys(latest);
+        const keysStr = dynamicKeys.length > 0 ? dynamicKeys.join(',') : Object.keys(this.fallbackThresholds).join(',');
+        const allKeys = dynamicKeys.length > 0 ? dynamicKeys : Object.keys(this.fallbackThresholds);
         const rawTelemetry = await this.telemetrySrv.getHistoricalTelemetry(devId, {
             keys: keysStr,
             startTs,
@@ -356,43 +397,44 @@ class ThingsBoardRESTBridge {
             limit: 5000,
             orderBy: 'ASC',
         });
-        // Structure raw metrics
+        // Structure raw metrics — process ALL keys, not just fallback thresholds
         const telemetryStreams = {};
-        for (const metric of Object.keys(thresholds)) {
-            telemetryStreams[metric] = { timestamps: [], values: [] };
+        for (const key of allKeys) {
+            telemetryStreams[key] = { timestamps: [], values: [] };
         }
         let totalPoints = 0;
         for (const [key, points] of Object.entries(rawTelemetry)) {
-            if (telemetryStreams[key]) {
-                for (const pt of points) {
-                    const val = parseFloat(pt.value);
-                    if (!isNaN(val)) {
-                        telemetryStreams[key].timestamps.push(pt.ts);
-                        telemetryStreams[key].values.push(val);
-                        totalPoints++;
-                    }
+            if (!telemetryStreams[key]) {
+                telemetryStreams[key] = { timestamps: [], values: [] };
+            }
+            for (const pt of points) {
+                const val = parseFloat(pt.value);
+                if (!isNaN(val)) {
+                    telemetryStreams[key].timestamps.push(pt.ts);
+                    telemetryStreams[key].values.push(val);
+                    totalPoints++;
                 }
             }
         }
-        // Process Statistics
+        // Process Statistics — use thresholds if available, else skip breach analysis
         const statsSummary = {};
         const breachesSummary = {};
-        for (const metric of Object.keys(thresholds)) {
-            const limits = thresholds[metric];
-            const data = telemetryStreams[metric];
-            statsSummary[metric] = this.calculateAdvancedStats(data.values, limits);
-            breachesSummary[metric] = { count: 0, points: [] };
+        for (const key of Object.keys(telemetryStreams)) {
+            const data = telemetryStreams[key];
+            const limits = thresholds[key] || { min: -Infinity, max: Infinity };
+            statsSummary[key] = this.calculateAdvancedStats(data.values, limits);
+            breachesSummary[key] = { count: 0, points: [] };
             for (let i = 0; i < data.values.length; i++) {
                 const ts = data.timestamps[i];
                 const val = data.values[i];
                 let breached = false;
-                if (limits.max !== undefined && val > limits.max)
+                if (limits.max !== undefined && limits.max !== Infinity && val > limits.max)
                     breached = true;
-                if (limits.min !== undefined && val < limits.min)
+                if (limits.min !== undefined && limits.min !== -Infinity && val < limits.min)
                     breached = true;
                 if (breached) {
-                    breachesSummary[metric].count++;
-                    breachesSummary[metric].points.push({ ts, val });
+                    breachesSummary[key].count++;
+                    breachesSummary[key].points.push({ ts, val });
                 }
             }
         }
@@ -449,11 +491,10 @@ class ThingsBoardRESTBridge {
             raw_data: reportData,
         };
     }
-    // Tool 9: create_device (Deepened Structure integration)
+    // Tool 9: create_device
     async createDevice(deviceName, deviceType, label = '', attributes, profileName) {
         try {
             const payload = { name: deviceName, type: deviceType, label };
-            // Optional association with specific device profile
             if (profileName) {
                 const profileList = await this.profileSrv.getDeviceProfiles(100);
                 const match = (profileList.data || []).find((p) => p.name.toLowerCase() === profileName.toLowerCase());
@@ -464,8 +505,8 @@ class ThingsBoardRESTBridge {
             const res = await this.deviceSrv.createOrUpdateDevice(payload);
             const devId = res.id?.id;
             if (devId) {
-                this.deviceCache[deviceName] = devId;
-                // Apply initial operational attributes if provided
+                // Invalidate any stale negative cache entry
+                this.deviceCache[deviceName] = { value: devId, expiresAt: 0 };
                 if (attributes && Object.keys(attributes).length > 0) {
                     await this.telemetrySrv.saveAttributes(devId, 'SERVER_SCOPE', attributes);
                 }
@@ -541,18 +582,17 @@ class ThingsBoardRESTBridge {
             return { status: 'error', message: e.message };
         }
     }
-    // Tool 15: create_alarm (Fully Redesigned & Structured)
+    // Tool 15: create_alarm
     async createAlarm(deviceName, alarmType, severity, details = null, metricParam, operatorCondition, comparisonValue) {
         const devId = await this.getDeviceId(deviceName);
         if (!devId)
             return { status: 'error', message: 'Device not found' };
         try {
             const ruleDetails = details || {};
-            // Structure dynamic evaluation thresholds (emulating UI config metrics)
             if (metricParam && operatorCondition && comparisonValue !== undefined) {
                 ruleDetails.condition = {
                     parameter: metricParam,
-                    operator: operatorCondition, // e.g., GREATER, LESS, EQUALS
+                    operator: operatorCondition,
                     threshold: comparisonValue,
                     triggered_value: comparisonValue
                 };
@@ -631,7 +671,8 @@ class ThingsBoardRESTBridge {
             const res = await this.assetSrv.createOrUpdateAsset({ name: assetName, type: assetType, label });
             const assetId = res.id?.id;
             if (assetId) {
-                this.assetCache[assetName] = assetId;
+                // Invalidate any stale negative cache entry
+                this.assetCache[assetName] = { value: assetId, expiresAt: 0 };
             }
             return { status: 'success', assetId, name: assetName };
         }
@@ -653,7 +694,7 @@ class ThingsBoardRESTBridge {
             return { status: 'error', message: e.message };
         }
     }
-    // Tool 21: create_relation (Resolves entity names dynamically under-the-hood)
+    // Tool 21: create_relation
     async createRelation(fromName, toName, relationType) {
         try {
             const fromObj = await this.resolveEntityIdAndType(fromName);
@@ -673,7 +714,7 @@ class ThingsBoardRESTBridge {
             return { status: 'error', message: e.message };
         }
     }
-    // Tool 22: delete_relation (Resolves entity names dynamically under-the-hood)
+    // Tool 22: delete_relation
     async deleteRelation(fromName, toName, relationType) {
         try {
             const fromObj = await this.resolveEntityIdAndType(fromName);
@@ -693,7 +734,7 @@ class ThingsBoardRESTBridge {
             return { status: 'error', message: e.message };
         }
     }
-    // Tool 23: list_relations (Transparent entity name mapping)
+    // Tool 23: list_relations
     async listRelations(entityName) {
         try {
             const obj = await this.resolveEntityIdAndType(entityName);
@@ -742,50 +783,57 @@ class ThingsBoardRESTBridge {
             return { status: 'error', message: e.message };
         }
     }
-    // Tool 36: create_device_dashboard (Structured multi-parameter parsing)
-    async createDeviceDashboard(deviceName, monitoredKeys = ['temperature', 'humidity', 'pressure'], dashboardTitle, backgroundColor = '#ffffff') {
+    // Tool 36: create_device_dashboard
+    async createDeviceDashboard(deviceName, monitoredKeys = ['temperature', 'humidity', 'pressure', 'vibration'], dashboardTitle, backgroundColor = '#ffffff') {
         const devId = await this.getDeviceId(deviceName);
         if (!devId)
             return { status: 'error', message: 'Device not found' };
         try {
             const title = dashboardTitle || `${deviceName} Operations Center`;
+            const widgetId = `widget_telemetry_${Date.now()}`;
+            const aliasId = `alias_${deviceName.replace(/\s+/g, '_')}`;
             const configuredDataKeys = monitoredKeys.map((key, i) => {
-                const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b'];
+                const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
                 return {
                     name: key,
                     type: 'timeseries',
-                    label: `${key.charAt(0).toUpperCase() + key.slice(1)}`,
-                    color: colors[i % colors.length]
+                    label: key.toUpperCase(),
+                    color: colors[i % colors.length],
+                    settings: {
+                        showLines: true,
+                        fillLines: true
+                    },
+                    useUnitFromMetadata: true
                 };
             });
             const dashboardConfig = {
                 title,
                 configuration: {
                     widgets: {
-                        '1': {
-                            isSystemType: true,
-                            bundleAlias: 'charts',
-                            typeAlias: 'timeseries_line_chart',
-                            type: 'timeseries',
-                            title: `${deviceName} Telemetry Real-time`,
+                        [widgetId]: {
+                            typeFullFqn: "system.charts.timeseries_line_chart",
+                            title: `${deviceName} Real-time Telemetry`,
                             sizeX: 16,
                             sizeY: 10,
                             config: {
                                 datasources: [
                                     {
                                         type: 'entity',
-                                        entityAliasHash: 'alias1',
+                                        entityAliasId: aliasId,
                                         dataKeys: configuredDataKeys,
                                     },
                                 ],
                                 timewindow: {
-                                    realtime: { timewindowMs: 60000 },
+                                    realtime: { timewindowMs: 3600000 }, // Last 1 hour
                                 },
                                 showTitle: true,
                                 backgroundColor: backgroundColor,
                                 color: 'rgba(0, 0, 0, 0.87)',
-                                padding: '8px',
+                                padding: '12px',
                                 settings: {
+                                    stack: false,
+                                    smoothLines: true,
+                                    showLegend: true,
                                     shadow: true,
                                 },
                             },
@@ -798,15 +846,15 @@ class ThingsBoardRESTBridge {
                             layouts: {
                                 main: {
                                     widgets: {
-                                        '1': { sizeX: 16, sizeY: 10, row: 0, col: 0 },
+                                        [widgetId]: { sizeX: 16, sizeY: 10, row: 0, col: 0 },
                                     },
                                 },
                             },
                         },
                     },
                     entityAliases: {
-                        alias1: {
-                            id: 'alias1',
+                        [aliasId]: {
+                            id: aliasId,
                             alias: deviceName,
                             filter: {
                                 type: 'singleEntity',
@@ -822,7 +870,7 @@ class ThingsBoardRESTBridge {
                 dashboardId: res.id?.id,
                 title: res.title,
                 monitored_parameters: monitoredKeys,
-                message: `Dashboard created successfully for ${deviceName}.`,
+                message: `Dashboard created successfully. You can view it in ThingsBoard UI for device ${deviceName}.`,
             };
         }
         catch (e) {
@@ -958,15 +1006,14 @@ class ThingsBoardRESTBridge {
             count: n,
             avg: parseFloat(avgVal.toFixed(2)),
             std_dev: parseFloat(stdDev.toFixed(2)),
-            min: parseFloat(Math.min(...values).toFixed(3)),
-            max: parseFloat(Math.max(...values).toFixed(3)),
+            min: parseFloat(this.safeMin(values).toFixed(3)),
+            max: parseFloat(this.safeMax(values).toFixed(3)),
             breach_percent: parseFloat(breachPercent.toFixed(1)),
         };
     }
     // Asynchronous and non-blocking filesystem operational loop
     async generateHtmlReportFileAsync(deviceName, startTs, endTs, streams, thresholds, breaches, alarms) {
         const reportDir = path.join(process.cwd(), 'reports');
-        // Asynchronous directory generation
         await fs_1.promises.mkdir(reportDir, { recursive: true });
         const filename = `industrial_audit_${deviceName}_${Math.floor(Date.now() / 1000)}.html`;
         const filepath = path.join(reportDir, filename);
@@ -1113,7 +1160,6 @@ class ThingsBoardRESTBridge {
       </script>
     </body>
     </html>`;
-        // Asynchronous non-blocking write file execution [2.3.1]
         await fs_1.promises.writeFile(filepath, htmlContent, 'utf-8');
         return filepath;
     }
@@ -1157,7 +1203,7 @@ class ThingsBoardRESTBridge {
         }
         return lines.join('\n');
     }
-    // Tool 37: forecast_what_if
+    // Tool 37: forecast_what_if — with timeout and top-level axios import
     async forecastWhatIf(args) {
         const deviceName = args.device_name;
         const targetMetric = args.target_metric;
@@ -1191,8 +1237,7 @@ class ThingsBoardRESTBridge {
                 orderBy: 'ASC',
             });
             // 3. Resample and Align Timestamps to a fixed 15-minute grid
-            const gridIntervalMs = 15 * 60 * 1000; // 15 minutes
-            // Determine overall start and end boundaries from data
+            const gridIntervalMs = 15 * 60 * 1000;
             let minTs = Infinity;
             let maxTs = -Infinity;
             for (const points of Object.values(rawTelemetry)) {
@@ -1203,12 +1248,10 @@ class ThingsBoardRESTBridge {
                         maxTs = pt.ts;
                 }
             }
-            // If no valid timestamps or not enough data, default to window
             if (minTs === Infinity || maxTs === -Infinity || maxTs - minTs < gridIntervalMs) {
                 minTs = startTs;
                 maxTs = endTs;
             }
-            // Align boundaries to 15-minute intervals
             const startGrid = Math.floor(minTs / gridIntervalMs) * gridIntervalMs;
             const endGrid = Math.floor(maxTs / gridIntervalMs) * gridIntervalMs;
             const timestampsGrid = [];
@@ -1233,7 +1276,6 @@ class ThingsBoardRESTBridge {
                 let dataIdx = 0;
                 let lastVal = pts[0]?.val ?? 0.0;
                 for (const targetTs of grid) {
-                    // Advance pointer to find closest historical value before or at targetTs
                     while (dataIdx < pts.length && pts[dataIdx].ts <= targetTs) {
                         lastVal = pts[dataIdx].val;
                         dataIdx++;
@@ -1251,7 +1293,6 @@ class ThingsBoardRESTBridge {
                 }
             }
             // 4. Construct payload for python FastAPI predictive sidecar
-            const axios = require('axios');
             const payload = {
                 target_name: targetMetric,
                 frequency_minutes: 15,
@@ -1265,7 +1306,9 @@ class ThingsBoardRESTBridge {
                 question_type: questionType,
                 crossing_threshold: crossingThreshold
             };
-            const response = await axios.post('http://localhost:8000/forecast_what_if', payload);
+            const response = await axios_1.default.post('http://localhost:8000/forecast_what_if', payload, {
+                timeout: 120000, // 120 second timeout for model inference
+            });
             return response.data;
         }
         catch (err) {
@@ -1275,1057 +1318,3 @@ class ThingsBoardRESTBridge {
     }
 }
 exports.ThingsBoardRESTBridge = ThingsBoardRESTBridge;
-// // Rest Bridge implementing operational tools
-// import * as fs from 'fs';
-// import * as path from 'path';
-// import { ThingsBoardClient } from './restClient';
-// import {
-//   DeviceService,
-//   TelemetryService,
-//   AlarmService,
-//   RuleEngineService,
-//   AssetService,
-//   RelationService,
-//   DashboardService,
-//   DeviceProfileService,
-//   RpcService,
-//   AuditService,
-// } from './services';
-// import { FallbackThresholds, MetricLimits, Alarm, RuleChain, Relation } from './types';
-// export class ThingsBoardRESTBridge {
-//   private client: ThingsBoardClient;
-//   private deviceSrv: DeviceService;
-//   private telemetrySrv: TelemetryService;
-//   private alarmSrv: AlarmService;
-//   private ruleSrv: RuleEngineService;
-//   private assetSrv: AssetService;
-//   private relationSrv: RelationService;
-//   private dashboardSrv: DashboardService;
-//   private profileSrv: DeviceProfileService;
-//   private rpcSrv: RpcService;
-//   private auditSrv: AuditService;
-//   private deviceCache: Record<string, string> = {};
-//   private assetCache: Record<string, string> = {};
-//   private fallbackThresholds: FallbackThresholds = {
-//     temperature: { min: 20.0, max: 75.0 },
-//     humidity: { min: 20.0, max: 85.0 },
-//     pressure: { min: 0.8, max: 1.4 },
-//     vibration: { min: 0.0, max: 4.0 },
-//   };
-//   constructor() {
-//     this.client = new ThingsBoardClient({
-//       baseUrl: process.env.THINGSBOARD_HOST || 'http://localhost:8080',
-//       username: process.env.THINGSBOARD_USERNAME || 'tenant@thingsboard.org',
-//       password: process.env.THINGSBOARD_PASSWORD || 'tenant',
-//       verifySsl: false,
-//     });
-//     this.deviceSrv = new DeviceService(this.client);
-//     this.telemetrySrv = new TelemetryService(this.client);
-//     this.alarmSrv = new AlarmService(this.client);
-//     this.ruleSrv = new RuleEngineService(this.client);
-//     this.assetSrv = new AssetService(this.client);
-//     this.relationSrv = new RelationService(this.client);
-//     this.dashboardSrv = new DashboardService(this.client);
-//     this.profileSrv = new DeviceProfileService(this.client);
-//     this.rpcSrv = new RpcService(this.client);
-//     this.auditSrv = new AuditService(this.client);
-//   }
-//   private isoToEpochMs(isoStr: string): number {
-//     try {
-//       return new Date(isoStr).getTime();
-//     } catch {
-//       return Date.now();
-//     }
-//   }
-//   private async getDeviceId(deviceName: string): Promise<string | null> {
-//     if (this.deviceCache[deviceName]) {
-//       return this.deviceCache[deviceName];
-//     }
-//     try {
-//       const res = await this.client.request<any>('GET', '/api/tenant/device', { deviceName });
-//       if (res && res.id) {
-//         const devId = res.id.id;
-//         this.deviceCache[deviceName] = devId;
-//         return devId;
-//       }
-//     } catch {
-//       // Graceful bypass
-//     }
-//     return null;
-//   }
-//   private async getAssetId(assetName: string): Promise<string | null> {
-//     if (this.assetCache[assetName]) {
-//       return this.assetCache[assetName];
-//     }
-//     try {
-//       const res = await this.client.request<any>('GET', '/api/tenant/asset', { assetName });
-//       if (res && res.id) {
-//         const assetId = res.id.id;
-//         this.assetCache[assetName] = assetId;
-//         return assetId;
-//       }
-//     } catch {
-//       // Graceful bypass
-//     }
-//     return null;
-//   }
-//   // Tool 1: list_devices
-//   public async listDevices(): Promise<string[]> {
-//     try {
-//       const res = await this.deviceSrv.getTenantDevices(100);
-//       return (res.data || []).map((d) => d.name);
-//     } catch {
-//       return [];
-//     }
-//   }
-//   // Tool 2: get_current_telemetry
-//   public async getLatestTelemetry(deviceName: string): Promise<Record<string, any>> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return {};
-//     try {
-//       const rawData = await this.telemetrySrv.getLatestTelemetry(devId);
-//       const data: Record<string, any> = {};
-//       for (const [key, valueArray] of Object.entries(rawData)) {
-//         if (valueArray && valueArray.length > 0) {
-//           const rawVal = valueArray[0].value;
-//           const num = parseFloat(rawVal);
-//           data[key] = isNaN(num) ? rawVal : parseFloat(num.toFixed(2));
-//         }
-//       }
-//       return data;
-//     } catch {
-//       return {};
-//     }
-//   }
-//   // Tool 3: get_historical_summary
-//   public async getHistoricalStats(deviceName: string, hours = 1): Promise<Record<string, any>> {
-//     const endTs = Date.now();
-//     const startTs = endTs - hours * 3600 * 1000;
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return {};
-//     const latest = await this.getLatestTelemetry(deviceName);
-//     const keys = Object.keys(latest).join(',');
-//     try {
-//       const telemetry = await this.telemetrySrv.getHistoricalTelemetry(devId, {
-//         keys,
-//         startTs,
-//         endTs,
-//         limit: 5000,
-//         orderBy: 'ASC',
-//       });
-//       const statsMap: Record<string, number[]> = {};
-//       for (const [key, list] of Object.entries(telemetry)) {
-//         statsMap[key] = list.map((pt) => parseFloat(pt.value)).filter((v) => !isNaN(v));
-//       }
-//       const result: Record<string, any> = {};
-//       for (const [key, vals] of Object.entries(statsMap)) {
-//         if (vals.length > 0) {
-//           const sum = vals.reduce((a, b) => a + b, 0);
-//           result[key] = {
-//             avg: parseFloat((sum / vals.length).toFixed(2)),
-//             min: parseFloat(Math.min(...vals).toFixed(2)),
-//             max: parseFloat(Math.max(...vals).toFixed(2)),
-//           };
-//         }
-//       }
-//       return result;
-//     } catch {
-//       return {};
-//     }
-//   }
-//   // Tool 4: get_active_alarms
-//   public async getActiveAlarms(): Promise<any[]> {
-//     const alarms: any[] = [];
-//     const devices = await this.listDevices();
-//     for (const dev of devices) {
-//       const devId = await this.getDeviceId(dev);
-//       if (!devId) continue;
-//       try {
-//         const statuses: Alarm['status'][] = ['ACTIVE_UNACK', 'ACTIVE_ACK'];
-//         for (const status of statuses) {
-//           const res = await this.client.request<any>('GET', `/api/alarm/DEVICE/${devId}`, {
-//             pageSize: 10,
-//             page: 0,
-//             status,
-//             sortProperty: 'createdTime',
-//             sortOrder: 'DESC',
-//           });
-//           for (const alarm of res.data || []) {
-//             alarms.push({
-//               device: dev,
-//               type: alarm.type,
-//               severity: alarm.severity,
-//               status: alarm.status,
-//               timestamp: alarm.createdTime,
-//             });
-//           }
-//         }
-//       } catch {
-//         // Continue loop
-//       }
-//     }
-//     const severityPriority: Record<string, number> = {
-//       CRITICAL: 4,
-//       MAJOR: 3,
-//       MINOR: 2,
-//       WARNING: 1,
-//       INDETERMINATE: 0,
-//     };
-//     alarms.sort((a, b) => {
-//       const sevDiff = (severityPriority[b.severity] ?? 0) - (severityPriority[a.severity] ?? 0);
-//       if (sevDiff !== 0) return sevDiff;
-//       return (b.timestamp ?? 0) - (a.timestamp ?? 0);
-//     });
-//     return alarms.slice(0, 10);
-//   }
-//   // Tool 5: get_device_attributes
-//   public async getAttributes(deviceName: string): Promise<Record<string, string>> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return {};
-//     try {
-//       const res = await this.client.request<any[]>('GET', `/api/plugins/telemetry/DEVICE/${devId}/values/attributes`);
-//       const attrs: Record<string, string> = {};
-//       for (const scopeData of res) {
-//         if (Array.isArray(scopeData)) {
-//           for (const item of scopeData) {
-//             attrs[item.key] = item.value !== undefined ? String(item.value) : 'N/A';
-//           }
-//         }
-//       }
-//       return attrs;
-//     } catch {
-//       return {};
-//     }
-//   }
-//   // Tool 6: get_highest_metric
-//   public async getHighestMetric(metric: string): Promise<any> {
-//     let highestVal = -Infinity;
-//     let highestDev: string | null = null;
-//     const devices = await this.listDevices();
-//     for (const dev of devices) {
-//       const latest = await this.getLatestTelemetry(dev);
-//       if (latest[metric] !== undefined) {
-//         const val = latest[metric];
-//         if (typeof val === 'number' && val > highestVal) {
-//           highestVal = val;
-//           highestDev = dev;
-//         }
-//       }
-//     }
-//     if (highestDev) {
-//       return { device: highestDev, value: highestVal, metric };
-//     }
-//     return {};
-//   }
-//   // Tool 7: get_metric_trend
-//   public async getMetricTrend(deviceName: string, metric: string): Promise<any> {
-//     const latest = await this.getLatestTelemetry(deviceName);
-//     const currentVal = latest[metric];
-//     const stats = await this.getHistoricalStats(deviceName, 1);
-//     const histAvg = stats[metric]?.avg;
-//     if (currentVal !== undefined && histAvg !== undefined && histAvg !== 0) {
-//       const diff = currentVal - histAvg;
-//       const percentage = (diff / histAvg) * 100;
-//       return {
-//         metric,
-//         current: parseFloat(currentVal.toFixed(2)),
-//         historical_avg: parseFloat(histAvg.toFixed(2)),
-//         percent_change: parseFloat(percentage.toFixed(1)),
-//         trend: percentage > 0.5 ? 'up' : percentage < -0.5 ? 'down' : 'stable',
-//       };
-//     }
-//     return {};
-//   }
-//   // Helper Threshold extraction
-//   public async getDeviceThresholds(deviceName: string): Promise<FallbackThresholds> {
-//     const thresholds: FallbackThresholds = JSON.parse(JSON.stringify(this.fallbackThresholds));
-//     const attrs = await this.getAttributes(deviceName);
-//     for (const [key, value] of Object.entries(attrs)) {
-//       try {
-//         if (key.includes('_limit_max')) {
-//           const metric = key.replace('_limit_max', '');
-//           if (thresholds[metric]) thresholds[metric].max = parseFloat(value);
-//         } else if (key.includes('_limit_min')) {
-//           const metric = key.replace('_limit_min', '');
-//           if (thresholds[metric]) thresholds[metric].min = parseFloat(value);
-//         }
-//       } catch {
-//         // Skip entry
-//       }
-//     }
-//     return thresholds;
-//   }
-//   // Tool 8: perform_deep_analysis
-//   public async performDeepAnalysis(
-//     deviceName: string,
-//     startTime?: string,
-//     endTime?: string,
-//     hours = 24
-//   ): Promise<any> {
-//     let startTs: number;
-//     let endTs: number;
-//     if (startTime && endTime) {
-//       startTs = this.isoToEpochMs(startTime);
-//       endTs = this.isoToEpochMs(endTime);
-//     } else {
-//       endTs = Date.now();
-//       startTs = endTs - hours * 3600 * 1000;
-//     }
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { error: 'Device not found' };
-//     const thresholds = await this.getDeviceThresholds(deviceName);
-//     // Fetch dynamic telemetry keys
-//     const latest = await this.getLatestTelemetry(deviceName);
-//     const keysStr = Object.keys(latest).join(',') || Object.keys(this.fallbackThresholds).join(',');
-//     const rawTelemetry = await this.telemetrySrv.getHistoricalTelemetry(devId, {
-//       keys: keysStr,
-//       startTs,
-//       endTs,
-//       limit: 5000,
-//       orderBy: 'ASC',
-//     });
-//     // Structure raw metrics
-//     const telemetryStreams: Record<string, { timestamps: number[]; values: number[] }> = {};
-//     for (const metric of Object.keys(thresholds)) {
-//       telemetryStreams[metric] = { timestamps: [], values: [] };
-//     }
-//     let totalPoints = 0;
-//     for (const [key, points] of Object.entries(rawTelemetry)) {
-//       if (telemetryStreams[key]) {
-//         for (const pt of points) {
-//           const val = parseFloat(pt.value);
-//           if (!isNaN(val)) {
-//             telemetryStreams[key].timestamps.push(pt.ts);
-//             telemetryStreams[key].values.push(val);
-//             totalPoints++;
-//           }
-//         }
-//       }
-//     }
-//     // Process Statistics
-//     const statsSummary: Record<string, any> = {};
-//     const breachesSummary: Record<string, { count: number; points: { ts: number; val: number }[] }> = {};
-//     for (const metric of Object.keys(thresholds)) {
-//       const limits = thresholds[metric];
-//       const data = telemetryStreams[metric];
-//       statsSummary[metric] = this.calculateAdvancedStats(data.values, limits);
-//       breachesSummary[metric] = { count: 0, points: [] };
-//       for (let i = 0; i < data.values.length; i++) {
-//         const ts = data.timestamps[i];
-//         const val = data.values[i];
-//         let breached = false;
-//         if (limits.max !== undefined && val > limits.max) breached = true;
-//         if (limits.min !== undefined && val < limits.min) breached = true;
-//         if (breached) {
-//           breachesSummary[metric].count++;
-//           breachesSummary[metric].points.push({ ts, val });
-//         }
-//       }
-//     }
-//     // Fetch historical alarms
-//     let alarms: any[] = [];
-//     try {
-//       const res = await this.client.request<any>('GET', `/api/alarm/DEVICE/${devId}`, {
-//         pageSize: 50,
-//         page: 0,
-//         startTime: startTs,
-//         endTime: endTs,
-//         sortProperty: 'createdTime',
-//         sortOrder: 'DESC',
-//       });
-//       alarms = (res.data || []).map((a: any) => ({
-//         type: a.type,
-//         severity: a.severity,
-//         status: a.status,
-//         timestamp: a.createdTime,
-//       }));
-//     } catch {
-//       // Graceful catch
-//     }
-//     // Deduplicate alarms
-//     const seenAlarms = new Set<string>();
-//     const mergedAlarms = [];
-//     for (const alarm of alarms) {
-//       const key = `${alarm.type}_${alarm.timestamp}`;
-//       if (!seenAlarms.has(key)) {
-//         mergedAlarms.push(alarm);
-//         seenAlarms.add(key);
-//       }
-//     }
-//     // Report File Export
-//     let htmlReportPath = 'N/A';
-//     if (totalPoints > 0) {
-//       htmlReportPath = this.generateHtmlReportFile(
-//         deviceName,
-//         startTs,
-//         endTs,
-//         telemetryStreams,
-//         thresholds,
-//         breachesSummary,
-//         mergedAlarms
-//       );
-//     }
-//     const reportData = {
-//       device: deviceName,
-//       window: {
-//         start: new Date(startTs).toISOString().replace('T', ' ').substring(0, 19),
-//         end: new Date(endTs).toISOString().replace('T', ' ').substring(0, 19),
-//       },
-//       total_points: totalPoints,
-//       stats: statsSummary,
-//       breaches: Object.fromEntries(Object.entries(breachesSummary).filter(([_, b]) => b.count > 0)),
-//       alarms: mergedAlarms,
-//       html_report: htmlReportPath,
-//     };
-//     return {
-//       report: this.formatMarkdownReport(reportData),
-//       raw_data: reportData,
-//     };
-//   }
-//   // Tool 9: create_device
-//   public async createDevice(deviceName: string, deviceType: string, label = ''): Promise<any> {
-//     try {
-//       const payload = { name: deviceName, type: deviceType, label };
-//       const res = await this.deviceSrv.createOrUpdateDevice(payload);
-//       const devId = res.id?.id;
-//       if (devId) {
-//         this.deviceCache[deviceName] = devId;
-//       }
-//       return { status: 'success', deviceId: devId, name: deviceName };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 10: delete_device
-//   public async deleteDevice(deviceName: string): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       await this.deviceSrv.deleteDevice(devId);
-//       delete this.deviceCache[deviceName];
-//       return { status: 'success', message: `Device ${deviceName} deleted successfully.` };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 11: get_device_credentials
-//   public async getDeviceCredentials(deviceName: string): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const res = await this.deviceSrv.getDeviceCredentials(devId);
-//       return { status: 'success', credentials: res };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 12: acknowledge_alarm
-//   public async acknowledgeAlarm(alarmId: string): Promise<any> {
-//     try {
-//       await this.alarmSrv.acknowledgeAlarm(alarmId);
-//       return { status: 'success', message: `Alarm ${alarmId} acknowledged.` };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 13: clear_alarm
-//   public async clearAlarm(alarmId: string): Promise<any> {
-//     try {
-//       await this.alarmSrv.clearAlarm(alarmId);
-//       return { status: 'success', message: `Alarm ${alarmId} cleared.` };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 14: trigger_rule_engine
-//   public async triggerRuleEngine(deviceName: string, message: any): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const ruleMsg = {
-//         msgType: 'POST_TELEMETRY_REQUEST',
-//         msg: message,
-//         metadata: { source: 'Gemini Agent Node' },
-//       };
-//       await this.ruleSrv.pushMessageToRuleEngine('DEVICE', devId, ruleMsg);
-//       return { status: 'success', message: 'Message successfully pushed to the rule engine.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 15: create_alarm
-//   public async createAlarm(deviceName: string, alarmType: string, severity: string, details: any = null): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const alarmDef = {
-//         type: alarmType,
-//         originator: {
-//           entityType: 'DEVICE' as const,
-//           id: devId,
-//         },
-//         severity: severity.toUpperCase() as any,
-//         details: details || {},
-//       };
-//       const res = await this.alarmSrv.saveAlarm(alarmDef);
-//       return { status: 'success', alarmId: res.id?.id, type: alarmType };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 16: create_rule_chain
-//   public async createRuleChain(name: string, nodes: any[], connections: any[], firstNodeIndex = 0): Promise<any> {
-//     try {
-//       const ruleChainDef: RuleChain = {
-//         name,
-//         type: 'CORE',
-//         debugMode: true,
-//         configuration: {},
-//       };
-//       const res = await this.ruleSrv.saveRuleChain(ruleChainDef);
-//       const rcId = res.id?.id;
-//       const metadata = {
-//         ruleChainId: { entityType: 'RULE_CHAIN', id: rcId },
-//         nodes,
-//         connections,
-//         firstNodeIndex,
-//       };
-//       await this.client.request('POST', '/api/ruleChain/metadata', undefined, metadata);
-//       return { status: 'success', ruleChainId: rcId, name };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 17: list_assets
-//   public async listAssets(): Promise<string[]> {
-//     try {
-//       const res = await this.assetSrv.getTenantAssets(100);
-//       return (res.data || []).map((a) => a.name);
-//     } catch {
-//       return [];
-//     }
-//   }
-//   // Tool 18: get_asset_by_name
-//   public async getAssetByName(assetName: string): Promise<any> {
-//     const assetId = await this.getAssetId(assetName);
-//     if (!assetId) return { error: 'Asset not found' };
-//     try {
-//       const res = await this.assetSrv.getAssetById(assetId);
-//       return { status: 'success', asset: res };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 19: create_asset
-//   public async createAsset(assetName: string, assetType: string, label = ''): Promise<any> {
-//     try {
-//       const res = await this.assetSrv.createOrUpdateAsset({ name: assetName, type: assetType, label });
-//       const assetId = res.id?.id;
-//       if (assetId) {
-//         this.assetCache[assetName] = assetId;
-//       }
-//       return { status: 'success', assetId, name: assetName };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 20: delete_asset
-//   public async deleteAsset(assetName: string): Promise<any> {
-//     const assetId = await this.getAssetId(assetName);
-//     if (!assetId) return { status: 'error', message: 'Asset not found' };
-//     try {
-//       await this.assetSrv.deleteAsset(assetId);
-//       delete this.assetCache[assetName];
-//       return { status: 'success', message: `Asset ${assetName} deleted successfully.` };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 21: create_relation
-//   public async createRelation(
-//     fromId: string,
-//     fromType: string,
-//     toId: string,
-//     toType: string,
-//     relationType: string
-//   ): Promise<any> {
-//     try {
-//       const relation: Relation = {
-//         from: { id: fromId, entityType: fromType as any },
-//         to: { id: toId, entityType: toType as any },
-//         type: relationType,
-//       };
-//       await this.relationSrv.createRelation(relation);
-//       return { status: 'success', message: 'Relation created successfully.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 22: delete_relation
-//   public async deleteRelation(
-//     fromId: string,
-//     fromType: string,
-//     toId: string,
-//     toType: string,
-//     relationType: string
-//   ): Promise<any> {
-//     try {
-//       const relation: Relation = {
-//         from: { id: fromId, entityType: fromType as any },
-//         to: { id: toId, entityType: toType as any },
-//         type: relationType,
-//       };
-//       await this.relationSrv.deleteRelation(relation);
-//       return { status: 'success', message: 'Relation deleted successfully.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 23: list_relations
-//   public async listRelations(entityId: string, entityType: string): Promise<any> {
-//     try {
-//       const relations = await this.relationSrv.listRelationsFrom(entityId, entityType);
-//       return { status: 'success', relations };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 24: save_device_attributes
-//   public async saveDeviceAttributes(deviceName: string, scope: string, attributes: any): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       await this.telemetrySrv.saveAttributes(devId, scope, attributes);
-//       return { status: 'success', message: 'Attributes saved successfully.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 25: delete_device_attributes
-//   public async deleteDeviceAttributes(deviceName: string, scope: string, keys: string[]): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       await this.telemetrySrv.deleteAttributes(devId, scope, keys);
-//       return { status: 'success', message: 'Attributes deleted successfully.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 26: list_dashboards
-//   public async listDashboards(): Promise<any> {
-//     try {
-//       const dashboards = await this.dashboardSrv.getTenantDashboards();
-//       return { status: 'success', dashboards: dashboards.data };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 36: create_device_dashboard
-//   public async createDeviceDashboard(deviceName: string): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       // 1. Construct a minimal functional dashboard configuration
-//       const dashboardTitle = `${deviceName} Operations Center`;
-//       const dashboardConfig = {
-//         title: dashboardTitle,
-//         configuration: {
-//           widgets: {
-//             '1': {
-//               isSystemType: true,
-//               bundleAlias: 'charts',
-//               typeAlias: 'timeseries_line_chart',
-//               type: 'timeseries',
-//               title: `${deviceName} Telemetry Real-time`,
-//               sizeX: 16,
-//               sizeY: 10,
-//               config: {
-//                 datasources: [
-//                   {
-//                     type: 'entity',
-//                     entityAliasHash: 'alias1',
-//                     dataKeys: [
-//                       { name: 'temperature', type: 'timeseries', label: 'Temperature (°C)', color: '#ef4444' },
-//                       { name: 'humidity', type: 'timeseries', label: 'Humidity (%)', color: '#3b82f6' },
-//                       { name: 'pressure', type: 'timeseries', label: 'Pressure (Bar)', color: '#10b981' },
-//                     ],
-//                   },
-//                 ],
-//                 timewindow: {
-//                   realtime: { timewindowMs: 60000 },
-//                 },
-//                 showTitle: true,
-//                 backgroundColor: '#ffffff',
-//                 color: 'rgba(0, 0, 0, 0.87)',
-//                 padding: '8px',
-//                 settings: {
-//                   shadow: true,
-//                 },
-//               },
-//             },
-//           },
-//           states: {
-//             default: {
-//               name: dashboardTitle,
-//               root: true,
-//               layouts: {
-//                 main: {
-//                   widgets: {
-//                     '1': { sizeX: 16, sizeY: 10, row: 0, col: 0 },
-//                   },
-//                 },
-//               },
-//             },
-//           },
-//           entityAliases: {
-//             alias1: {
-//               id: 'alias1',
-//               alias: deviceName,
-//               filter: {
-//                 type: 'singleEntity',
-//                 singleEntity: { entityType: 'DEVICE', id: devId },
-//               },
-//             },
-//           },
-//         },
-//       };
-//       const res = await this.dashboardSrv.saveDashboard(dashboardConfig as any);
-//       return {
-//         status: 'success',
-//         dashboardId: res.id?.id,
-//         title: res.title,
-//         message: `Dashboard created successfully for ${deviceName}.`,
-//       };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 27: get_dashboard_by_id
-//   public async getDashboardById(dashboardId: string): Promise<any> {
-//     try {
-//       const dashboard = await this.dashboardSrv.getDashboardById(dashboardId);
-//       return { status: 'success', dashboard };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 28: assign_dashboard_to_customer
-//   public async assignDashboardToCustomer(customerId: string, dashboardId: string): Promise<any> {
-//     try {
-//       const res = await this.dashboardSrv.assignDashboardToCustomer(customerId, dashboardId);
-//       return { status: 'success', dashboard: res };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 29: list_device_profiles
-//   public async listDeviceProfiles(): Promise<any> {
-//     try {
-//       const profiles = await this.profileSrv.getDeviceProfiles();
-//       return { status: 'success', profiles: profiles.data };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 30: get_device_profile_by_id
-//   public async getDeviceProfileById(profileId: string): Promise<any> {
-//     try {
-//       const profile = await this.profileSrv.getDeviceProfileById(profileId);
-//       return { status: 'success', profile };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 31: send_one_way_rpc
-//   public async sendOneWayRpc(deviceName: string, method: string, params: any): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       await this.rpcSrv.sendOneWayRpc(devId, { method, params });
-//       return { status: 'success', message: 'One-way RPC request transmitted.' };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 32: send_two_way_rpc
-//   public async sendTwoWayRpc(deviceName: string, method: string, params: any): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const response = await this.rpcSrv.sendTwoWayRpc(devId, { method, params });
-//       return { status: 'success', response };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 33: list_persistent_rpcs
-//   public async listPersistentRpcs(deviceName: string): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const rpcs = await this.rpcSrv.listPersistentRpcs(devId);
-//       return { status: 'success', rpcs };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 34: inject_rule_engine_queue
-//   public async injectRuleEngineQueue(
-//     deviceName: string,
-//     messagePayload: any,
-//     queueName: string
-//   ): Promise<any> {
-//     const devId = await this.getDeviceId(deviceName);
-//     if (!devId) return { status: 'error', message: 'Device not found' };
-//     try {
-//       const message: any = {
-//         msgType: 'POST_TELEMETRY_REQUEST',
-//         msg: messagePayload,
-//         metadata: { source: 'Gemini Agent Queue Dispatcher' },
-//       };
-//       await this.ruleSrv.pushMessageToRuleEngine('DEVICE', devId, message, queueName);
-//       return { status: 'success', message: `Injected into ${queueName} queue successfully.` };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   // Tool 35: get_audit_logs
-//   public async getAuditLogs(): Promise<any> {
-//     try {
-//       const logs = await this.auditSrv.getAuditLogs();
-//       return { status: 'success', logs: logs.data };
-//     } catch (e: any) {
-//       return { status: 'error', message: e.message };
-//     }
-//   }
-//   private calculateAdvancedStats(values: number[], limits: MetricLimits): any {
-//     if (!values || values.length === 0) {
-//       return { count: 0, avg: 0.0, std_dev: 0.0, min: 0.0, max: 0.0, breach_percent: 0.0 };
-//     }
-//     const n = values.length;
-//     const avgVal = values.reduce((a, b) => a + b, 0) / n;
-//     const variance = n > 1 ? values.reduce((sum, val) => sum + Math.pow(val - avgVal, 2), 0) / n : 0.0;
-//     const stdDev = Math.sqrt(variance);
-//     let breachPoints = 0;
-//     for (const val of values) {
-//       if (limits.max !== undefined && val > limits.max) {
-//         breachPoints++;
-//       } else if (limits.min !== undefined && val < limits.min) {
-//         breachPoints++;
-//       }
-//     }
-//     const breachPercent = (breachPoints / n) * 100;
-//     return {
-//       count: n,
-//       avg: parseFloat(avgVal.toFixed(2)),
-//       std_dev: parseFloat(stdDev.toFixed(2)),
-//       min: parseFloat(Math.min(...values).toFixed(3)),
-//       max: parseFloat(Math.max(...values).toFixed(3)),
-//       breach_percent: parseFloat(breachPercent.toFixed(1)),
-//     };
-//   }
-//   private generateHtmlReportFile(
-//     deviceName: string,
-//     startTs: number,
-//     endTs: number,
-//     streams: Record<string, { timestamps: number[]; values: number[] }>,
-//     thresholds: FallbackThresholds,
-//     breaches: Record<string, { count: number }>,
-//     alarms: any[]
-//   ): string {
-//     const reportDir = path.join(process.cwd(), 'reports');
-//     if (!fs.existsSync(reportDir)) {
-//       fs.mkdirSync(reportDir, { recursive: true });
-//     }
-//     const filename = `industrial_audit_${deviceName}_${Math.floor(Date.now() / 1000)}.html`;
-//     const filepath = path.join(reportDir, filename);
-//     // Structure metrics safely into Javascript arrays for browser execution
-//     const clientTraceData: any[] = [];
-//     const colors: Record<string, string> = {
-//       temperature: '#ef4444',
-//       humidity: '#3b82f6',
-//       pressure: '#10b981',
-//       vibration: '#f59e0b',
-//     };
-//     for (const [metric, data] of Object.entries(streams)) {
-//       if (data.values.length === 0) continue;
-//       const xTimes = data.timestamps.map((t) => new Date(t).toISOString());
-//       // Base Line
-//       clientTraceData.push({
-//         x: xTimes,
-//         y: data.values,
-//         name: metric.toUpperCase(),
-//         type: 'scatter',
-//         mode: 'lines',
-//         line: { color: colors[metric] || '#64748b', width: 2 },
-//       });
-//       // Max Threshold Line
-//       const lim = thresholds[metric];
-//       if (lim && lim.max !== undefined) {
-//         clientTraceData.push({
-//           x: [xTimes[0], xTimes[xTimes.length - 1]],
-//           y: [lim.max, lim.max],
-//           name: `${metric.toUpperCase()} Limit Max`,
-//           type: 'scatter',
-//           mode: 'lines',
-//           line: { color: colors[metric] || '#64748b', width: 1, dash: 'dash' },
-//           hoverinfo: 'skip',
-//         });
-//       }
-//       if (lim && lim.min !== undefined) {
-//         clientTraceData.push({
-//           x: [xTimes[0], xTimes[xTimes.length - 1]],
-//           y: [lim.min, lim.min],
-//           name: `${metric.toUpperCase()} Limit Min`,
-//           type: 'scatter',
-//           mode: 'lines',
-//           line: { color: colors[metric] || '#64748b', width: 1, dash: 'dot' },
-//           hoverinfo: 'skip',
-//         });
-//       }
-//     }
-//     const metricsList = Object.keys(streams).filter((m) => streams[m].values.length > 0);
-//     const barTrace = {
-//       x: metricsList.map((m) => m.toUpperCase()),
-//       y: metricsList.map((m) => breaches[m]?.count || 0),
-//       type: 'bar',
-//       marker: { color: metricsList.map((m) => colors[m] || '#64748b') },
-//       name: 'Violations Count',
-//     };
-//     const rawTracesJson = JSON.stringify(clientTraceData);
-//     const rawBarTraceJson = JSON.stringify([barTrace]);
-//     const htmlContent = `
-//     <!DOCTYPE html>
-//     <html lang="en">
-//     <head>
-//       <meta charset="UTF-8">
-//       <title>Industrial Audit: ${deviceName}</title>
-//       <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
-//       <style>
-//         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; margin: 0; padding: 20px; }
-//         .container { max-width: 1100px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
-//         .header { border-bottom: 2px solid #e2e8f0; padding-bottom: 20px; margin-bottom: 30px; }
-//         .header h1 { margin: 0 0 10px 0; color: #1e293b; font-size: 24px; }
-//         .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
-//         .chart-box { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin-bottom: 20px; }
-//         .table-box { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; }
-//         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-//         th, td { text-align: left; padding: 10px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
-//         th { background: #f8fafc; color: #64748b; font-weight: 600; }
-//         .badge { display: inline-block; padding: 2px 8px; font-size: 11px; font-weight: 600; border-radius: 9999px; text-transform: uppercase; }
-//         .badge-critical { background: #fee2e2; color: #991b1b; }
-//         .badge-warning { background: #fef3c7; color: #92400e; }
-//       </style>
-//     </head>
-//     <body>
-//       <div class="container">
-//         <div class="header">
-//           <h1>Industrial Health Audit: ${deviceName}</h1>
-//           <p style="color: #64748b; margin: 0;">Time Period: ${new Date(startTs).toLocaleString()} to ${new Date(endTs).toLocaleString()}</p>
-//         </div>
-//         <div class="grid">
-//           <div>
-//             <div class="chart-box">
-//               <h3 style="margin-top: 0;">Historical Metrics Trendlines</h3>
-//               <div id="trendChart"></div>
-//             </div>
-//             <div class="chart-box">
-//               <h3 style="margin-top: 0;">Threshold Excursion Counts</h3>
-//               <div id="barChart"></div>
-//             </div>
-//           </div>
-//           <div>
-//             <div class="table-box">
-//               <h3 style="margin-top: 0;">Logged System Alarms (${alarms.length})</h3>
-//               <table>
-//                 <thead>
-//                   <tr>
-//                     <th>Alarm</th>
-//                     <th>Severity</th>
-//                     <th>Status</th>
-//                   </tr>
-//                 </thead>
-//                 <tbody>
-//                   ${
-//                     alarms.length === 0
-//                       ? '<tr><td colspan="3" style="text-align:center; color:#94a3b8;">No recent alarms</td></tr>'
-//                       : alarms
-//                           .slice(0, 10)
-//                           .map(
-//                             (a) => `
-//                     <tr>
-//                       <td><strong>${a.type}</strong></td>
-//                       <td><span class="badge badge-${a.severity.toLowerCase() === 'critical' ? 'critical' : 'warning'}">${a.severity}</span></td>
-//                       <td><span style="font-size: 12px; color: #475569;">${a.status}</span></td>
-//                     </tr>`
-//                           )
-//                           .join('')
-//                   }
-//                 </tbody>
-//               </table>
-//             </div>
-//           </div>
-//         </div>
-//       </div>
-//       <script>
-//         const trendData = ${rawTracesJson};
-//         const barData = ${rawBarTraceJson};
-//         Plotly.newPlot('trendChart', trendData, {
-//           height: 380,
-//           margin: { l: 40, r: 20, t: 10, b: 40 },
-//           template: 'plotly_white',
-//           showlegend: true,
-//           legend: { orientation: 'h', y: 1.1 }
-//         });
-//         Plotly.newPlot('barChart', barData, {
-//           height: 220,
-//           margin: { l: 40, r: 20, t: 10, b: 30 },
-//           template: 'plotly_white',
-//           showlegend: false
-//         });
-//       </script>
-//     </body>
-//     </html>`;
-//     fs.writeFileSync(filepath, htmlContent, 'utf-8');
-//     return filepath;
-//   }
-//   public formatMarkdownReport(data: any): string {
-//     const lines = [
-//       `# Industrial Health Audit: ${data.device}`,
-//       `**Interval:** ${data.window.start} to ${data.window.end}`,
-//       `**Total Data Points Scanned:** ${data.total_points}`,
-//       `\n## Threshold Analysis:`,
-//     ];
-//     const breachEntries = Object.entries(data.breaches);
-//     if (breachEntries.length === 0) {
-//       lines.push('  *No threshold breaches logged. All systems are reporting normally.*');
-//     } else {
-//       for (const [metric, b] of breachEntries as any[]) {
-//         const st = data.stats[metric];
-//         lines.push(`### ${metric.toUpperCase()}:`);
-//         lines.push(`  - **Breaches Count:** ${b.count} out-of-bounds occurrences (${st.breach_percent}% breach duration).`);
-//         lines.push(`  - **Deviation Spreads:** Avg ${st.avg} | Max ${st.max} | Min ${st.min} (SD: ±${st.std_dev})`);
-//         if (b.points && b.points.length > 0) {
-//           const worst = b.points.reduce((maxPt: any, pt: any) => (pt.val > maxPt.val ? pt : maxPt), b.points[0]);
-//           const timeStr = new Date(worst.ts).toTimeString().substring(0, 8);
-//           lines.push(`  - **Highest Breach Point:** ${worst.val} reached at ${timeStr}`);
-//         }
-//       }
-//     }
-//     lines.push(`\n## Alarms Logged (${data.alarms.length}):`);
-//     if (data.alarms.length === 0) {
-//       lines.push('  *No system alarms triggered.*');
-//     } else {
-//       for (const alarm of data.alarms.slice(0, 5)) {
-//         const timeStr = new Date(alarm.timestamp).toTimeString().substring(0, 8);
-//         lines.push(`  - **[${timeStr}] ${alarm.type}** (${alarm.severity}): ${alarm.status}`);
-//       }
-//     }
-//     if (data.html_report !== 'N/A') {
-//       lines.push(`\n## Artifact Output:`);
-//       lines.push(`  - **HTML Visual Report Saved:** \`${data.html_report}\``);
-//     }
-//     return lines.join('\n');
-//   }
-// }

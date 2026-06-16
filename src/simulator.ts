@@ -16,11 +16,6 @@ const MQTT_PORT = parseInt(process.env.THINGSBOARD_MQTT_PORT || '1883', 10);
 const SIMULATION_INTERVAL_MS = parseInt(process.env.SIMULATION_INTERVAL_SECONDS || '15', 10) * 1000;
 const PORT = parseInt(process.env.SIMULATOR_PORT || '9005', 10);
 
-const DEVICES_CONFIG: Record<string, string | undefined> = {
-  'Smart-Industrial-Sensor-01': undefined,
-  'Smart-Industrial-Sensor-02': undefined,
-};
-
 class StableMQTTClient {
   private client: mqtt.MqttClient | null = null;
   public connected = false;
@@ -72,18 +67,27 @@ class StableMQTTClient {
 
 const activeClients: Record<string, StableMQTTClient> = {};
 const deviceIntervals: Record<string, NodeJS.Timeout> = {};
+const deviceTelemetryKeys: Record<string, string[]> = {};
 
-function generateSensorTelemetry(): Record<string, number> {
-  return {
-    temperature: parseFloat((Math.random() * (85.0 - 20.0) + 20.0).toFixed(2)),
-    humidity: parseFloat((Math.random() * (90.0 - 30.0) + 30.0).toFixed(2)),
-    pressure: parseFloat((Math.random() * (1.5 - 0.9) + 0.9).toFixed(3)),
-    vibration: parseFloat((Math.random() * (4.5 - 0.01) + 0.01).toFixed(2)),
-  };
+function generateSensorTelemetry(deviceName: string): Record<string, number> {
+  const keys = deviceTelemetryKeys[deviceName] || ['temperature', 'humidity', 'pressure', 'vibration'];
+  const telemetry: Record<string, number> = {};
+  
+  for (const key of keys) {
+    if (key === 'temperature') telemetry[key] = parseFloat((Math.random() * (85.0 - 20.0) + 20.0).toFixed(2));
+    else if (key === 'humidity') telemetry[key] = parseFloat((Math.random() * (90.0 - 30.0) + 30.0).toFixed(2));
+    else if (key === 'pressure') telemetry[key] = parseFloat((Math.random() * (1.5 - 0.9) + 0.9).toFixed(3));
+    else if (key === 'vibration') telemetry[key] = parseFloat((Math.random() * (4.5 - 0.01) + 0.01).toFixed(2));
+    else {
+      // For unknown keys, generate a generic random value between 0 and 100
+      telemetry[key] = parseFloat((Math.random() * 100).toFixed(2));
+    }
+  }
+  return telemetry;
 }
 
 async function autoProvisionDevices() {
-  console.log('🔄 Checking and auto-provisioning devices in ThingsBoard...');
+  console.log('🔄 Syncing all devices from ThingsBoard for simulation...');
   const tbClient = new ThingsBoardClient({
     baseUrl: process.env.THINGSBOARD_HOST || 'http://localhost:8080',
     username: process.env.THINGSBOARD_USERNAME || 'tenant@thingsboard.org',
@@ -91,49 +95,50 @@ async function autoProvisionDevices() {
     verifySsl: false,
   });
 
-  const deviceNames = Object.keys(DEVICES_CONFIG);
+  const bridge = new ThingsBoardRESTBridge();
 
-  for (const name of deviceNames) {
-    try {
-      let deviceId: string | null = null;
-      
+  try {
+    // 1. Fetch all devices from tenant
+    const devicesRes = await tbClient.request<any>('GET', '/api/tenant/devices', { pageSize: 100, page: 0 });
+    const devices = devicesRes.data || [];
+
+    for (const device of devices) {
+      const name = device.name;
+      const deviceId = device.id.id;
+
       try {
-        const response = await tbClient.request<any>('GET', '/api/tenant/device', { deviceName: name });
-        if (response && response.id) {
-          deviceId = response.id.id;
-          console.log(`✓ Device found: ${name} (${deviceId})`);
+        // 2. Resolve credentials
+        const credentials = await tbClient.request<any>('GET', `/api/device/${deviceId}/credentials`);
+        const token = credentials.credentialsId;
+
+        if (token && !activeClients[name]) {
+          const client = new StableMQTTClient(name, token);
+          client.connect();
+          activeClients[name] = client;
+          console.log(`✓ Simulation client ready for: ${name}`);
         }
-      } catch {
-        // Handled silently
-      }
 
-      if (!deviceId) {
-        console.log(`+ Creating device: ${name}...`);
-        const createResponse = await tbClient.request<any>('POST', '/api/device', undefined, {
-          name,
-          type: 'sensor',
-        });
-        deviceId = createResponse.id.id;
-        console.log(`✓ Device created: ${name} (${deviceId})`);
+        // 3. Resolve active telemetry keys for dynamic schema
+        const latest = await bridge.getLatestTelemetry(name);
+        const keys = Object.keys(latest);
+        if (keys.length > 0) {
+          deviceTelemetryKeys[name] = keys;
+        } else {
+          deviceTelemetryKeys[name] = ['temperature', 'humidity', 'pressure', 'vibration'];
+        }
+      } catch (err: any) {
+        console.error(`❌ Failed to sync credentials/keys for ${name}:`, err.message);
       }
-
-      const credentials = await tbClient.request<any>('GET', `/api/device/${deviceId}/credentials`);
-      const token = credentials.credentialsId;
-
-      if (token) {
-        DEVICES_CONFIG[name] = token;
-        console.log(`✓ Access Token resolved programmatically for ${name}`);
-      }
-    } catch (err: any) {
-      console.error(`❌ Failed to auto-provision credentials for ${name}:`, err.message || err);
     }
+  } catch (err: any) {
+    console.error(`❌ Global device sync failed:`, err.message);
   }
 }
 
 export async function startSimulatorAPI() {
   const app = express();
 
-  // Shared bridge instance — reused across all REST requests (avoids per-request auth)
+  // Shared bridge instance
   const bridge = new ThingsBoardRESTBridge();
 
   app.use((req, res, next) => {
@@ -160,13 +165,8 @@ export async function startSimulatorAPI() {
 
   await autoProvisionDevices();
 
-  for (const [name, token] of Object.entries(DEVICES_CONFIG)) {
-    if (token) {
-      const client = new StableMQTTClient(name, token);
-      client.connect();
-      activeClients[name] = client;
-    }
-  }
+  // Periodic device refresh every 5 minutes
+  setInterval(autoProvisionDevices, 5 * 60 * 1000);
 
   app.post('/simulation/start/:deviceName', (req: Request, res: Response) => {
     const { deviceName } = req.params;
@@ -176,7 +176,7 @@ export async function startSimulatorAPI() {
 
     deviceIntervals[deviceName] = setInterval(async () => {
       if (client.connected) {
-        const payload = generateSensorTelemetry();
+        const payload = generateSensorTelemetry(deviceName);
         await client.publish(payload);
       }
     }, SIMULATION_INTERVAL_MS);
@@ -199,7 +199,7 @@ export async function startSimulatorAPI() {
       if (!deviceIntervals[name]) {
         deviceIntervals[name] = setInterval(async () => {
           if (activeClients[name].connected) {
-            await activeClients[name].publish(generateSensorTelemetry());
+            await activeClients[name].publish(generateSensorTelemetry(name));
           }
         }, SIMULATION_INTERVAL_MS);
       }

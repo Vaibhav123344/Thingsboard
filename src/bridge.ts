@@ -823,7 +823,7 @@ export class ThingsBoardRESTBridge {
   // Tool 36: create_device_dashboard
   public async createDeviceDashboard(
     deviceName: string, 
-    monitoredKeys: string[] = ['temperature', 'humidity', 'pressure'],
+    monitoredKeys: string[] = ['temperature', 'humidity', 'pressure', 'vibration'],
     dashboardTitle?: string,
     backgroundColor = '#ffffff'
   ): Promise<any> {
@@ -832,14 +832,21 @@ export class ThingsBoardRESTBridge {
 
     try {
       const title = dashboardTitle || `${deviceName} Operations Center`;
+      const widgetId = `widget_telemetry_${Date.now()}`;
+      const aliasId = `alias_${deviceName.replace(/\s+/g, '_')}`;
       
       const configuredDataKeys = monitoredKeys.map((key, i) => {
-        const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b'];
+        const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
         return {
           name: key,
           type: 'timeseries',
-          label: `${key.charAt(0).toUpperCase() + key.slice(1)}`,
-          color: colors[i % colors.length]
+          label: key.toUpperCase(),
+          color: colors[i % colors.length],
+          settings: {
+            showLines: true,
+            fillLines: true
+          },
+          useUnitFromMetadata: true
         };
       });
 
@@ -847,30 +854,30 @@ export class ThingsBoardRESTBridge {
         title,
         configuration: {
           widgets: {
-            '1': {
-              isSystemType: true,
-              bundleAlias: 'charts',
-              typeAlias: 'timeseries_line_chart',
-              type: 'timeseries',
-              title: `${deviceName} Telemetry Real-time`,
+            [widgetId]: {
+              typeFullFqn: "system.charts.timeseries_line_chart",
+              title: `${deviceName} Real-time Telemetry`,
               sizeX: 16,
               sizeY: 10,
               config: {
                 datasources: [
                   {
                     type: 'entity',
-                    entityAliasHash: 'alias1',
+                    entityAliasId: aliasId,
                     dataKeys: configuredDataKeys,
                   },
                 ],
                 timewindow: {
-                  realtime: { timewindowMs: 60000 },
+                  realtime: { timewindowMs: 3600000 }, // Last 1 hour
                 },
                 showTitle: true,
                 backgroundColor: backgroundColor,
                 color: 'rgba(0, 0, 0, 0.87)',
-                padding: '8px',
+                padding: '12px',
                 settings: {
+                  stack: false,
+                  smoothLines: true,
+                  showLegend: true,
                   shadow: true,
                 },
               },
@@ -883,15 +890,15 @@ export class ThingsBoardRESTBridge {
               layouts: {
                 main: {
                   widgets: {
-                    '1': { sizeX: 16, sizeY: 10, row: 0, col: 0 },
+                    [widgetId]: { sizeX: 16, sizeY: 10, row: 0, col: 0 },
                   },
                 },
               },
             },
           },
           entityAliases: {
-            alias1: {
-              id: 'alias1',
+            [aliasId]: {
+              id: aliasId,
               alias: deviceName,
               filter: {
                 type: 'singleEntity',
@@ -908,7 +915,7 @@ export class ThingsBoardRESTBridge {
         dashboardId: res.id?.id,
         title: res.title,
         monitored_parameters: monitoredKeys,
-        message: `Dashboard created successfully for ${deviceName}.`,
+        message: `Dashboard created successfully. You can view it in ThingsBoard UI for device ${deviceName}.`,
       };
     } catch (e: any) {
       return { status: 'error', message: e.message };
