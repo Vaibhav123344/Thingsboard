@@ -46,24 +46,40 @@ services:
     networks:
       - tb-network
 
+  chronos-engine:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - tb-network
+
   iot-simulator:
     build:
       context: .
       dockerfile: Dockerfile
     restart: always
     ports:
-      - "9001:9001"
+      - "9005:9005"
     environment:
-      # Use internal Docker service name for connection routing
+      THINGSBOARD_HOST: http://thingsboard-ce:8080
       THINGSBOARD_MQTT_HOST: thingsboard-ce
       THINGSBOARD_MQTT_PORT: 1883
+      THINGSBOARD_USERNAME: tenant@thingsboard.org
+      THINGSBOARD_PASSWORD: tenant
       SIMULATION_INTERVAL_SECONDS: 15
-      SENSOR_01_TOKEN: "your_sensor_01_token" # Replace with actual token from TB UI
-      SENSOR_02_TOKEN: "your_sensor_02_token" # Replace with actual token from TB UI
+      SIMULATOR_PORT: 9005
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
     volumes:
-      - ./reports:/usr/src/app/reports        # Maps output HTML reports back to your local host folder
+      - ./reports:/usr/src/app/reports
     depends_on:
       thingsboard-ce:
+        condition: service_started
+      chronos-engine:
         condition: service_started
     networks:
       - tb-network

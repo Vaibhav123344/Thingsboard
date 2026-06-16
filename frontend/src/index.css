@@ -1,8 +1,8 @@
 :root {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color-scheme: dark;
-  background-color: #020617; /* Deeper midnight blue */
-  color: #f8fafc;
+  color-scheme: light;
+  background-color: #f8fafc; /* Slate 50 */
+  color: #0f172a; /* Slate 900 */
 }
 
 body {
@@ -10,32 +10,35 @@ body {
   padding: 0;
   box-sizing: border-box;
   overflow-x: hidden;
-  background: radial-gradient(circle at top right, #1e293b, #020617);
+  background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%); /* Clean, bright light gradient */
   background-attachment: fixed;
 }
 
-/* Glass Card styling - Refined for "Industrial" look */
+/* Glass Card styling - Refined for light mode premium look */
 .glass-card {
-  background: rgba(15, 23, 42, 0.65);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(12px) saturate(160%);
+  -webkit-backdrop-filter: blur(12px) saturate(160%);
+  border: 1px solid rgba(226, 232, 240, 0.8);
   border-radius: 16px;
   padding: 24px;
-  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
-  transition: transform 0.2s ease, border-color 0.2s ease;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03), 0 20px 25px -5px rgba(0, 0, 0, 0.02);
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .glass-card:hover {
-  border-color: rgba(16, 185, 129, 0.3);
+  border-color: rgba(37, 99, 235, 0.3); /* Soft blue border highlight on hover */
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.03);
 }
 
+/* Keep Console/Terminal panels dark to match classic coder aesthetic and enhance text contrast */
 .terminal-box {
-  background: #000000;
-  border: 1px solid #1e293b;
+  background: #0f172a; /* Slate 900 */
+  border: 1px solid #e2e8f0;
   border-radius: 12px;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.6);
+  box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.2);
+  color: #f8fafc;
 }
 
 /* Scrollbar styling */
@@ -46,23 +49,23 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: #cbd5e1; /* Slate 300 */
   border-radius: 10px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+  background: #94a3b8; /* Slate 400 */
 }
 
 /* Glowing Animations */
 @keyframes pulseGlow {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
-  70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
-  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.3); }
+  70% { transform: scale(1.03); box-shadow: 0 0 0 8px rgba(37, 99, 235, 0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
 }
 
 @keyframes pulseRecord {
   0% { transform: scale(1); filter: brightness(1); }
-  50% { transform: scale(1.1); filter: brightness(1.3); box-shadow: 0 0 20px rgba(239, 68, 68, 0.5); }
+  50% { transform: scale(1.08); filter: brightness(1.1); box-shadow: 0 0 15px rgba(239, 68, 68, 0.4); }
   100% { transform: scale(1); filter: brightness(1); }
 }
 
@@ -71,10 +74,10 @@ body {
 }
 
 .glow-record {
-  animation: pulseRecord 1s infinite cubic-bezier(0.4, 0, 0.6, 1);
+  animation: pulseRecord 1.2s infinite cubic-bezier(0.4, 0, 0.6, 1);
 }
 
-/* Custom table styles */
+/* Custom table styles - Adjusted for Light theme */
 .industrial-table {
   width: 100%;
   border-collapse: separate;
@@ -82,12 +85,26 @@ body {
 }
 
 .industrial-table tr {
-  background: rgba(30, 41, 59, 0.3);
+  background: rgba(241, 245, 249, 0.8);
   border-radius: 8px;
+  transition: background 0.2s;
+}
+
+.industrial-table tr:hover {
+  background: rgba(226, 232, 240, 0.9);
 }
 
 .industrial-table td, .industrial-table th {
   padding: 12px 16px;
+  color: #334155;
+}
+
+.industrial-table th {
+  color: #64748b;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.5px;
 }
 
 .industrial-table tr td:first-child { border-top-left-radius: 8px; border-bottom-left-radius: 8px; }

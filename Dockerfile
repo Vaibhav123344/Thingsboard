@@ -17,7 +17,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # Expose Simulator Control Panel port
-EXPOSE 9001
+EXPOSE 9005
 
 # Boot the compiled simulator script
 CMD ["node", "dist/simulator.js"]

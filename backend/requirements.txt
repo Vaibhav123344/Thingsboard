@@ -4,8 +4,9 @@
 # Core Deep Learning Framework (GPU Enabled)
 torch>=2.3.0
 
-# TimesFM Engine with Torch specific dependencies
-timesfm[torch]>=2.0.1
+# Chronos-2 Engine with Torch specific dependencies
+chronos-forecasting>=2.2.0
+scipy>=1.12.0
 
 # High-Performance Async Web Server Stack
 fastapi>=0.110.0
