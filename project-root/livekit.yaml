@@ -1,0 +1,20 @@
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+# Set true for local dev — disables TLS requirement
+development: true
+
+# Must match LIVEKIT_API_KEY / LIVEKIT_API_SECRET in .env
+keys:
+  devkey: "secretkeydefaultvalue987654321012"
+
+rtc:
+  tcp_port: 7881
+  udp_port: 50000
+  port_range_end: 60000
+  use_external_ip: false
+
+logging:
+  level: info
+  pion_level: error

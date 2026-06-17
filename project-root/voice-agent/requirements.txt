@@ -1,0 +1,17 @@
+# ── LiveKit agent framework ───────────────────────────────────────────────────
+livekit-agents[openai,silero]>=0.11.0
+livekit-plugins-openai>=0.10.0
+livekit-plugins-silero>=0.6.0
+
+# Silero VAD needs PyTorch on the host
+torch>=2.2.0
+
+# ── Async HTTP (tool calls + service health checks) ───────────────────────────
+aiohttp>=3.9.5
+
+# ── Audio frame slicing in custom_tts.py ─────────────────────────────────────
+numpy>=1.26.0
+soundfile>=0.12.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.1

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+fillers/
+agent.py
+custom_tts.py
+filler_prerender.py
+requirements.txt
+*.log
+*.gguf

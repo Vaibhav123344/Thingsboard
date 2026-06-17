@@ -633,12 +633,15 @@ export class ThingsBoardRESTBridge {
       }
 
       const alarmDef = {
+        name: alarmType,
         type: alarmType,
         originator: {
           entityType: 'DEVICE' as const,
           id: devId,
         },
         severity: severity.toUpperCase() as any,
+        status: 'ACTIVE_UNACK',
+        propagate: true,
         details: ruleDetails,
       };
       const res = await this.alarmSrv.saveAlarm(alarmDef);

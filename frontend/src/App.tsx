@@ -1,5 +1,10 @@
 // frontend/src/App.tsx
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { 
+  LiveKitRoom,
+  RoomAudioRenderer,
+  useLocalParticipant,
+} from '@livekit/components-react';
 import { 
   Mic, MicOff, Send, AlertTriangle, 
   Terminal, Radio, Play, Square,
@@ -11,10 +16,21 @@ import { DeviceInfo, AlarmLog, TerminalLog } from './types';
 const TEMP_THRESHOLD = 80.0;
 const VIB_THRESHOLD = 4.0;
 
+const LIVEKIT_SERVER = 'ws://localhost:7880';
+const TOKEN_ENDPOINT = 'http://localhost:9005/api/livekit/token';
+
+async function fetchRoomToken(room: string): Promise<string> {
+  const identity = `operator-${Date.now()}`;
+  const url = `${TOKEN_ENDPOINT}?room=${encodeURIComponent(room)}&identity=${identity}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Token fetch failed: ${res.statusText}`);
+  const data = await res.json();
+  return data.token;
+}
+
 export default function App() {
-  // Connection states
-  const [wsConnected, setWsConnected] = useState(false);
-  const [geminiStatus, setGeminiStatus] = useState('Standby');
+  const [roomToken, setRoomToken] = useState<string | null>(null);
+  const [livekitConnected, setLivekitConnected] = useState(false);
   
   // Real-time Dashboard variables
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
@@ -25,68 +41,26 @@ export default function App() {
 
   // Chat and transcription outputs
   const [userInput, setUserInput] = useState('');
-  const [transcription, setTranscription] = useState('');
   const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>([
     { timestamp: new Date().toLocaleTimeString(), type: 'info', message: 'Industrial Copilot Zephyr initialized.' }
   ]);
 
-  // High-performance Audio State (Live Mode)
-  const [isLiveMode, setIsLiveMode] = useState(false);
-  
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  
-  // Speaker state
-  const speakerContextRef = useRef<AudioContext | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const audioQueueRef = useRef<AudioBuffer[]>([]);
-  const isPlayingRef = useRef<boolean>(false);
-
-  // Retrieve current active keys for the selected device
   const selectedDevObj = devices.find(d => d.name === selectedDevice);
   const telemetry = selectedDevObj?.lastTelemetry || {};
 
-  // WebSocket + initial load
   useEffect(() => {
-    connectWS();
     fetchSimulationStatus();
     fetchInitialDevices();
-
-    const alarmInterval = setInterval(() => {
-      refreshAlarms();
-    }, 10000);
-
-    return () => {
-      wsRef.current?.close();
-      clearInterval(alarmInterval);
-      if (isLiveMode) stopVoiceInput();
-    };
+    const alarmInterval = setInterval(() => refreshAlarms(), 10000);
+    return () => clearInterval(alarmInterval);
   }, []);
 
-  // Telemetry polling
   useEffect(() => {
     if (!selectedDevice) return;
     refreshTelemetry();
-
-    const telemetryInterval = setInterval(() => {
-      refreshTelemetry();
-    }, 5000);
-
-    return () => {
-      clearInterval(telemetryInterval);
-    };
+    const telemetryInterval = setInterval(() => refreshTelemetry(), 5000);
+    return () => clearInterval(telemetryInterval);
   }, [selectedDevice]);
-
-  // Audio effect for Live Mode
-  useEffect(() => {
-    if (isLiveMode) {
-      startVoiceInput();
-    } else {
-      stopVoiceInput();
-    }
-  }, [isLiveMode]);
 
   const fetchInitialDevices = async () => {
     try {
@@ -107,13 +81,7 @@ export default function App() {
       const res = await fetch(`http://localhost:9005/simulation/telemetry/${selectedDevice}`);
       if (!res.ok) return;
       const telemetryData = await res.json();
-      
-      setDevices(prev => prev.map(dev => {
-        if (dev.name === selectedDevice) {
-          return { ...dev, lastTelemetry: telemetryData };
-        }
-        return dev;
-      }));
+      setDevices(prev => prev.map(dev => dev.name === selectedDevice ? { ...dev, lastTelemetry: telemetryData } : dev));
     } catch {}
   };
 
@@ -132,196 +100,6 @@ export default function App() {
         details: a.details
       })));
     } catch {}
-  };
-
-  const connectWS = () => {
-    const ws = new WebSocket('ws://localhost:9005/ws/voice');
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setWsConnected(true);
-      addLog('status', 'Neural link established with Zephyr Gateway.');
-    };
-
-    ws.onmessage = async (event) => {
-      if (typeof event.data === 'string') {
-        const payload = JSON.parse(event.data);
-        switch (payload.type) {
-          case 'status':
-            setGeminiStatus(payload.message);
-            break;
-          case 'transcription':
-            setTranscription(prev => prev + payload.text);
-            break;
-          case 'audio_chunk':
-            playAudioChunk(payload.data);
-            break;
-          case 'tool_start':
-            addLog('tool_start', `Tool sequence: ${payload.name}()`);
-            break;
-          case 'tool_complete':
-            addLog('tool_complete', `Response received: ${payload.name}`);
-            processToolImpact(payload.name, payload.result);
-            break;
-          case 'turn_complete':
-            setTranscription('');
-            break;
-        }
-      }
-    };
-
-    ws.onclose = () => {
-      setWsConnected(false);
-      setGeminiStatus('Reconnecting...');
-      setTimeout(connectWS, 3000);
-    };
-  };
-
-  const startVoiceInput = async () => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-    try {
-      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-      });
-
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: 16000,
-      });
-
-      const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
-      scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-
-      scriptProcessorRef.current.onaudioprocess = (event) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-        const float32Samples = event.inputBuffer.getChannelData(0);
-        const int16Samples = new Int16Array(float32Samples.length);
-
-        for (let i = 0; i < float32Samples.length; i++) {
-          const s = Math.max(-1, Math.min(1, float32Samples[i]));
-          int16Samples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        wsRef.current.send(int16Samples.buffer);
-      };
-
-      source.connect(scriptProcessorRef.current);
-      scriptProcessorRef.current.connect(audioContextRef.current.destination);
-      
-      addLog('info', 'Voice capture active. Streaming 16kHz PCM.');
-    } catch (err: any) {
-      addLog('error', `Mic failed: ${err.message}`);
-      setIsLiveMode(false);
-    }
-  };
-
-  const stopVoiceInput = () => {
-    scriptProcessorRef.current?.disconnect();
-    audioContextRef.current?.close();
-    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
-    scriptProcessorRef.current = null;
-    audioContextRef.current = null;
-    mediaStreamRef.current = null;
-  };
-
-  const playAudioChunk = async (base64Data: string) => {
-    try {
-      if (!speakerContextRef.current) {
-        speakerContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      }
-      const ctx = speakerContextRef.current;
-      
-      const binaryStr = window.atob(base64Data);
-      const len = binaryStr.length;
-      const bytes = new Int16Array(len / 2);
-      const view = new DataView(new Uint8Array(len).map((_, i) => binaryStr.charCodeAt(i)).buffer);
-      
-      for (let i = 0; i < bytes.length; i++) {
-        bytes[i] = view.getInt16(i * 2, true);
-      }
-
-      const audioBuffer = ctx.createBuffer(1, bytes.length, 24000);
-      const channelData = audioBuffer.getChannelData(0);
-      for (let i = 0; i < bytes.length; i++) {
-        channelData[i] = bytes[i] / 32768.0;
-      }
-
-      audioQueueRef.current.push(audioBuffer);
-      if (!isPlayingRef.current) {
-        playNextInQueue();
-      }
-    } catch (e) {
-      console.error('Playback error:', e);
-    }
-  };
-
-  const playNextInQueue = () => {
-    if (audioQueueRef.current.length === 0 || !speakerContextRef.current) {
-      isPlayingRef.current = false;
-      return;
-    }
-
-    isPlayingRef.current = true;
-    const ctx = speakerContextRef.current;
-    const buffer = audioQueueRef.current.shift()!;
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-
-    const currentTime = ctx.currentTime;
-    if (nextStartTimeRef.current < currentTime) {
-      nextStartTimeRef.current = currentTime;
-    }
-
-    source.start(nextStartTimeRef.current);
-    nextStartTimeRef.current += buffer.duration;
-    
-    source.onended = () => {
-      playNextInQueue();
-    };
-  };
-
-  const processToolImpact = (name: string, result: any) => {
-    if (name === 'list_devices') {
-      const fetchedNames: string[] = result.result || [];
-      setDevices(fetchedNames.map(n => ({ name: n, status: 'ONLINE' })));
-    } else if (name === 'get_current_telemetry') {
-      const telemetryData = result;
-      setDevices(prev => prev.map(dev => {
-        if (dev.name === selectedDevice) return { ...dev, lastTelemetry: telemetryData };
-        return dev;
-      }));
-    } else if (name === 'get_active_alarms') {
-      const activeAlarms: any[] = result.result || [];
-      setAlarms(activeAlarms.map(a => ({
-        id: a.id,
-        device: a.originatorName,
-        type: a.type,
-        severity: a.severity,
-        status: a.status,
-        timestamp: a.timestamp,
-        details: a.details
-      })));
-    } else if (name === 'create_device') {
-      addLog('info', `Entity registered: ${result.name}`);
-      fetchInitialDevices();
-    } else if (name === 'forecast_what_if') {
-      if (result && result.status === 'success') {
-        setPredictionReport(result);
-        addLog('info', `Predictive What-If: Analysis for ${result.target_metric} loaded.`);
-      } else {
-        addLog('error', `What-If Analysis failed: ${result?.error || 'Unknown error'}`);
-      }
-    }
-  };
-
-  const addLog = (type: TerminalLog['type'], message: string) => {
-    setTerminalLogs(prev => [
-      { timestamp: new Date().toLocaleTimeString(), type, message },
-      ...prev.slice(0, 50)
-    ]);
   };
 
   const toggleSimulation = async () => {
@@ -343,14 +121,41 @@ export default function App() {
     } catch {}
   };
 
-  const handleSendPrompt = () => {
-    if (!userInput.trim() || !wsRef.current) return;
-    addLog('user', userInput);
-    wsRef.current.send(JSON.stringify({ type: 'text', text: userInput }));
-    setUserInput('');
+  const addLog = (type: TerminalLog['type'], message: string) => {
+    setTerminalLogs(prev => [
+      { timestamp: new Date().toLocaleTimeString(), type, message },
+      ...prev.slice(0, 50)
+    ]);
   };
 
-  // --- Sub-render Methods ---
+  const handleToggleLiveMode = useCallback(async (activate: boolean) => {
+    if (activate) {
+      setIsConnecting(true);
+      try {
+        const token = await fetchRoomToken('zephyr-operational-room');
+        setRoomToken(token);
+        setLivekitConnected(true);
+        addLog('status', 'Neural link established with Zephyr Gateway via LiveKit.');
+      } catch (err) {
+        console.error('Could not obtain LiveKit token:', err);
+        addLog('error', 'Failed to connect to LiveKit Gateway.');
+      } finally {
+        setIsConnecting(false);
+      }
+    } else {
+      setRoomToken(null);
+      setLivekitConnected(false);
+      addLog('status', 'LiveKit Gateway disconnected.');
+    }
+  }, []);
+
+  const handleSendPrompt = () => {
+    if (!userInput.trim()) return;
+    addLog('user', userInput);
+    // TODO: Connect this to the LiveKit data channel or a separate chat endpoint if needed.
+    // For now, the primary interaction is voice.
+    setUserInput('');
+  };
 
   const renderNavbar = () => (
     <header style={{ 
@@ -373,8 +178,8 @@ export default function App() {
       
       <div style={{ display: 'flex', gap: '24px', alignItems: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', fontWeight: 700 }}>
-          <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: wsConnected ? '#10b981' : '#ef4444', boxShadow: wsConnected ? '0 0 8px #10b981' : 'none' }}></div>
-          <span style={{ color: '#475569' }}>SYSTEM {wsConnected ? 'READY' : 'OFFLINE'}</span>
+          <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: livekitConnected ? '#10b981' : '#ef4444', boxShadow: livekitConnected ? '0 0 8px #10b981' : 'none' }}></div>
+          <span style={{ color: '#475569' }}>SYSTEM {livekitConnected ? 'READY' : 'OFFLINE'}</span>
         </div>
         
         <button 
@@ -527,26 +332,22 @@ export default function App() {
               <Activity size={20} style={{ color: '#38bdf8' }} />
               <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: '#f8fafc', letterSpacing: '0.5px' }}>ZEPHYR NEURAL LINK</h3>
             </div>
-            <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 700 }}>AI STATUS: <span style={{ color: '#38bdf8' }}>{geminiStatus.toUpperCase()}</span></div>
-          </div>
-
-          <div style={{ minHeight: '80px', maxHeight: '150px', overflowY: 'auto', color: '#cbd5e1', fontSize: '18px', fontWeight: 300, lineHeight: '1.6', fontStyle: transcription ? 'normal' : 'italic' }}>
-            {transcription || "Listening for operational queries..."}
+            <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 700 }}>AI STATUS: <span style={{ color: '#38bdf8' }}>{livekitConnected ? 'ONLINE' : 'STANDBY'}</span></div>
           </div>
 
           <div style={{ display: 'flex', gap: '20px', alignItems: 'center' }}>
-            <button 
-              onClick={() => setIsLiveMode(!isLiveMode)}
+            {/* The microphone button here is decorative; actual logic is in MicController via LiveKit */}
+            <div 
               style={{
                 width: '72px', height: '72px', borderRadius: '50%', border: 'none',
-                background: isLiveMode ? '#ef4444' : '#38bdf8',
-                color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                boxShadow: isLiveMode ? '0 0 20px rgba(239, 68, 68, 0.4)' : '0 0 20px rgba(56, 189, 248, 0.4)',
+                background: livekitConnected ? '#ef4444' : '#38bdf8',
+                color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                boxShadow: livekitConnected ? '0 0 20px rgba(239, 68, 68, 0.4)' : '0 0 20px rgba(56, 189, 248, 0.4)',
                 transition: 'all 0.3s'
               }}
             >
-              {isLiveMode ? <MicOff size={32} /> : <Mic size={32} />}
-            </button>
+              {livekitConnected ? <Mic size={32} /> : <MicOff size={32} />}
+            </div>
 
             <div style={{ flex: 1, position: 'relative' }}>
               <input 
@@ -571,10 +372,10 @@ export default function App() {
           </div>
           
           <div style={{ textAlign: 'center' }}>
-            {isLiveMode ? (
+            {livekitConnected ? (
               <div style={{ fontSize: '11px', color: '#ef4444', fontWeight: 800, letterSpacing: '2px' }} className="blink">● LIVE RECORDING ACTIVE</div>
             ) : (
-              <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600 }}>TOGGLE MICROPHONE FOR REAL-TIME VOICE COMMANDS</div>
+              <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600 }}>USE THE FLOATING MICROPHONE BUTTON TO CONNECT</div>
             )}
           </div>
         </div>
@@ -603,14 +404,53 @@ export default function App() {
     </section>
   );
 
+  const commonLayout = (
+    <>
+      {renderSidebar()}
+      {renderMainContent()}
+      {renderTerminal()}
+    </>
+  );
+
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#fff', color: '#1e293b', overflow: 'hidden' }}>
       {renderNavbar()}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {renderSidebar()}
-        {renderMainContent()}
-        {renderTerminal()}
-      </div>
+
+      {livekitConnected && roomToken ? (
+        <LiveKitRoom
+          video={false}
+          audio={true}
+          token={roomToken}
+          serverUrl={LIVEKIT_SERVER}
+          onConnected={() => addLog('status', '[LiveKit] Joined operational room')}
+          onDisconnected={() => {
+            addLog('status', '[LiveKit] Disconnected');
+            setLivekitConnected(false);
+            setRoomToken(null);
+          }}
+          onError={(err) => addLog('error', `[LiveKit] Error: ${err.message}`)}
+          options={{
+            audioCaptureDefaults: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }
+          }}
+        >
+          <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+            {commonLayout}
+          </div>
+
+          {/* Core components for S2S architecture */}
+          <RoomAudioRenderer />
+          <MicController onToggle={handleToggleLiveMode} isActive={livekitConnected} />
+        </LiveKitRoom>
+      ) : (
+        <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+          {commonLayout}
+          <MicController onToggle={handleToggleLiveMode} isActive={false} />
+        </div>
+      )}
 
       <style>{`
         .glow-active { animation: glow 2s infinite ease-in-out; }
@@ -628,5 +468,50 @@ export default function App() {
         ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
       `}</style>
     </div>
+  );
+}
+
+function MicController({
+  onToggle,
+  isActive,
+}: {
+  onToggle: (active: boolean) => void;
+  isActive: boolean;
+}) {
+  const { localParticipant } = useLocalParticipant();
+
+  const handleClick = async () => {
+    if (isActive) {
+      await localParticipant?.setMicrophoneEnabled(false);
+      onToggle(false);
+    } else {
+      // The toggle handler handles connecting to the room.
+      // Once connected, LiveKit handles the microphone based on constraints.
+      onToggle(true);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleClick}
+      style={{
+        position: 'fixed',
+        bottom: 24,
+        right: 24,
+        width: 64,
+        height: 64,
+        borderRadius: '50%',
+        background: isActive ? '#ef4444' : '#38bdf8',
+        border: 'none',
+        cursor: 'pointer',
+        fontSize: 24,
+        boxShadow: isActive ? '0 0 16px rgba(239,68,68,0.6)' : '0 4px 12px rgba(0,0,0,0.3)',
+        transition: 'all 0.2s ease',
+        zIndex: 1000
+      }}
+      title={isActive ? 'Stop Live Mode' : 'Start Live Mode'}
+    >
+      {isActive ? '🔴' : '🎙️'}
+    </button>
   );
 }

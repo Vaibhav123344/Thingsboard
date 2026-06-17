@@ -42,11 +42,10 @@ const express_1 = __importDefault(require("express"));
 const mqtt = __importStar(require("mqtt"));
 const http = __importStar(require("http"));
 const path = __importStar(require("path"));
-const ws_1 = require("ws");
 const dotenv = __importStar(require("dotenv"));
-const live_agent_ws_1 = require("./live_agent_ws");
 const restClient_1 = require("./restClient");
 const bridge_1 = require("./bridge");
+const livekitRoutes_1 = require("./livekitRoutes");
 dotenv.config();
 const MQTT_HOST = process.env.THINGSBOARD_MQTT_HOST || 'localhost';
 const MQTT_PORT = parseInt(process.env.THINGSBOARD_MQTT_PORT || '1883', 10);
@@ -282,60 +281,14 @@ async function startSimulatorAPI() {
             res.status(500).json({ error: err.message });
         }
     });
+    // Inside startSimulatorAPI(), below app.use(express.json());
+    app.use('/api/livekit', livekitRoutes_1.livekitRouter);
+    app.use('/api/tools', livekitRoutes_1.toolsRouter);
+    // Re-write the server creation entirely to just HTTP
     const server = http.createServer(app);
-    const wss = new ws_1.WebSocketServer({ noServer: true });
-    server.on('upgrade', (request, socket, head) => {
-        const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
-        if (pathname === '/ws/voice') {
-            wss.handleUpgrade(request, socket, head, (ws) => {
-                wss.emit('connection', ws, request);
-            });
-        }
-        else {
-            socket.destroy();
-        }
-    });
-    wss.on('connection', (ws) => {
-        const broker = new live_agent_ws_1.GeminiLiveWSBroker(ws);
-        broker.start();
-        let isAlive = true;
-        ws.on('pong', () => { isAlive = true; });
-        const pingInterval = setInterval(() => {
-            if (!isAlive) {
-                clearInterval(pingInterval);
-                return ws.terminate();
-            }
-            isAlive = false;
-            ws.ping();
-        }, 30000);
-        // Handles BOTH binary streams (PCM chunks) and stringified JSON payloads
-        ws.on('message', (message, isBinary) => {
-            try {
-                if (isBinary || Buffer.isBuffer(message) || message instanceof ArrayBuffer) {
-                    const rawBuffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
-                    const base64Audio = rawBuffer.toString('base64');
-                    broker.handleClientMessage({
-                        type: 'audio_chunk',
-                        data: base64Audio
-                    });
-                }
-                else {
-                    const parsed = JSON.parse(message.toString());
-                    broker.handleClientMessage(parsed);
-                }
-            }
-            catch (e) {
-                console.warn('[WS Gateway] Bypassing malformed client packet:', e.message);
-            }
-        });
-        ws.on('close', () => {
-            clearInterval(pingInterval);
-            broker.close();
-        });
-    });
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`Stable Ingestion Layer Simulation listening on port ${PORT}`);
-        console.log(`WebSocket Gateway mounted on ws://localhost:${PORT}/ws/voice`);
+        console.log(`LiveKit Token & Tool Gateway mounted successfully.`);
     });
 }
 // Graceful shutdown for both SIGTERM and SIGINT (Windows Ctrl+C)

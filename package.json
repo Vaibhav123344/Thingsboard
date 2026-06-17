@@ -10,12 +10,11 @@
     "dev:simulator": "ts-node src/simulator.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.0.0",
     "axios": "^1.6.8",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "mqtt": "^5.5.0",
-    "ws": "^8.16.0"
+    "livekit-server-sdk": "^2.15.4",
+    "mqtt": "^5.5.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
