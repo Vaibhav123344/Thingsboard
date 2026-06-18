@@ -14,8 +14,9 @@ import {
   DeviceProfileService,
   RpcService,
   AuditService,
+  EntityQueryService,
 } from './services';
-import { FallbackThresholds, MetricLimits, Alarm, RuleChain, Relation } from './types';
+import { FallbackThresholds, MetricLimits, Alarm, RuleChain, Relation, EntityType, AlarmSeverity, AlarmStatus } from './types';
 
 // Cache entry with TTL support for negative lookups
 interface CacheEntry {
@@ -37,6 +38,7 @@ export class ThingsBoardRESTBridge {
   private profileSrv: DeviceProfileService;
   private rpcSrv: RpcService;
   private auditSrv: AuditService;
+  private entityQuerySrv: EntityQueryService;
 
   // Supports caching with TTL for negative lookups
   private deviceCache: Record<string, CacheEntry> = {};
@@ -67,6 +69,7 @@ export class ThingsBoardRESTBridge {
     this.profileSrv = new DeviceProfileService(this.client);
     this.rpcSrv = new RpcService(this.client);
     this.auditSrv = new AuditService(this.client);
+    this.entityQuerySrv = new EntityQueryService(this.client);
   }
 
   private isoToEpochMs(isoStr: string): number {
@@ -160,12 +163,13 @@ export class ThingsBoardRESTBridge {
   }
 
   // Tool 2: get_current_telemetry
-  public async getLatestTelemetry(deviceName: string): Promise<Record<string, any>> {
+  public async getLatestTelemetry(deviceName: string, keys?: string): Promise<Record<string, any>> {
     const devId = await this.getDeviceId(deviceName);
     if (!devId) return {};
 
     try {
-      const rawData = await this.telemetrySrv.getLatestTelemetry(devId);
+      const keysArray = keys ? keys.split(',').map(k => k.trim()) : undefined;
+      const rawData = await this.telemetrySrv.getLatestTelemetry(devId, keysArray);
       const data: Record<string, any> = {};
       for (const [key, valueArray] of Object.entries(rawData)) {
         if (valueArray && valueArray.length > 0) {
@@ -182,24 +186,42 @@ export class ThingsBoardRESTBridge {
   }
 
   // Tool 3: get_historical_summary
-  public async getHistoricalStats(deviceName: string, hours = 1): Promise<Record<string, any>> {
-    const endTs = Date.now();
-    const startTs = endTs - hours * 3600 * 1000;
-
+  public async getHistoricalStats(
+    deviceName: string, 
+    hours = 1,
+    keys?: string,
+    startTs?: number,
+    endTs?: number,
+    agg: any = 'NONE',
+    interval?: number
+  ): Promise<Record<string, any>> {
     const devId = await this.getDeviceId(deviceName);
     if (!devId) return {};
 
-    const latest = await this.getLatestTelemetry(deviceName);
-    const keys = Object.keys(latest).join(',');
+    const calculatedEndTs = endTs ?? Date.now();
+    const calculatedStartTs = startTs ?? (calculatedEndTs - hours * 3600 * 1000);
+
+    let keysStr = keys;
+    if (!keysStr) {
+      const latest = await this.getLatestTelemetry(deviceName);
+      keysStr = Object.keys(latest).join(',');
+    }
 
     try {
-      const telemetry = await this.telemetrySrv.getHistoricalTelemetry(devId, {
-        keys,
-        startTs,
-        endTs,
+      const query: any = {
+        keys: keysStr,
+        startTs: calculatedStartTs,
+        endTs: calculatedEndTs,
         limit: 5000,
         orderBy: 'ASC',
-      });
+      };
+
+      if (agg && agg !== 'NONE') {
+        query.agg = agg;
+        query.interval = interval || 60000; // default 1 min
+      }
+
+      const telemetry = await this.telemetrySrv.getHistoricalTelemetry(devId, query);
 
       const statsMap: Record<string, number[]> = {};
       for (const [key, list] of Object.entries(telemetry)) {
@@ -266,11 +288,15 @@ export class ThingsBoardRESTBridge {
     try {
       const res = await this.telemetrySrv.getAttributes(devId);
       const attrs: Record<string, string> = {};
-      for (const scopeData of res) {
-        if (Array.isArray(scopeData)) {
-          for (const item of scopeData) {
-            attrs[item.key] = item.value !== undefined ? String(item.value) : 'N/A';
+      for (const item of res) {
+        if (Array.isArray(item)) {
+          for (const nestedItem of item) {
+            if (nestedItem && nestedItem.key !== undefined) {
+              attrs[nestedItem.key] = nestedItem.value !== undefined ? String(nestedItem.value) : 'N/A';
+            }
           }
+        } else if (item && item.key !== undefined) {
+          attrs[item.key] = item.value !== undefined ? String(item.value) : 'N/A';
         }
       }
       return attrs;
@@ -514,17 +540,22 @@ export class ThingsBoardRESTBridge {
     deviceName: string, 
     deviceType: string, 
     label = '', 
-    attributes?: Record<string, any>,
+    attributes?: any,
     profileName?: string
   ): Promise<any> {
     try {
       const payload: any = { name: deviceName, type: deviceType, label };
 
       if (profileName) {
-        const profileList = await this.profileSrv.getDeviceProfiles(100);
-        const match = (profileList.data || []).find((p: any) => p.name.toLowerCase() === profileName.toLowerCase());
-        if (match) {
-          payload.deviceProfileId = match.id;
+        // If profileName is already a UUID or lookslike one, construct it directly
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(profileName)) {
+          payload.deviceProfileId = { id: profileName, entityType: 'DEVICE_PROFILE' };
+        } else {
+          const profileList = await this.profileSrv.getDeviceProfiles(100);
+          const match = (profileList.data || []).find((p: any) => p.name.toLowerCase() === profileName.toLowerCase());
+          if (match) {
+            payload.deviceProfileId = match.id;
+          }
         }
       }
 
@@ -535,8 +566,17 @@ export class ThingsBoardRESTBridge {
         // Invalidate any stale negative cache entry
         this.deviceCache[deviceName] = { value: devId, expiresAt: 0 };
 
-        if (attributes && Object.keys(attributes).length > 0) {
-          await this.telemetrySrv.saveAttributes(devId, 'SERVER_SCOPE', attributes);
+        let parsedAttrs = attributes;
+        if (typeof attributes === 'string') {
+          try {
+            parsedAttrs = JSON.parse(attributes);
+          } catch {
+            parsedAttrs = {};
+          }
+        }
+
+        if (parsedAttrs && Object.keys(parsedAttrs).length > 0) {
+          await this.telemetrySrv.saveAttributes(devId, 'SERVER_SCOPE', parsedAttrs);
         }
       }
       return { status: 'success', deviceId: devId, name: deviceName, profile: profileName || 'default' };
@@ -615,13 +655,14 @@ export class ThingsBoardRESTBridge {
     details: any = null,
     metricParam?: string,
     operatorCondition?: string,
-    comparisonValue?: number
+    comparisonValue?: number,
+    status = 'ACTIVE_UNACK'
   ): Promise<any> {
-    const devId = await this.getDeviceId(deviceName);
-    if (!devId) return { status: 'error', message: 'Device not found' };
+    const entity = await this.resolveEntityIdAndType(deviceName);
+    if (!entity) return { status: 'error', message: `Entity '${deviceName}' not found` };
     
     try {
-      const ruleDetails = details || {};
+      const ruleDetails = typeof details === 'string' ? { description: details } : (details || {});
       
       if (metricParam && operatorCondition && comparisonValue !== undefined) {
         ruleDetails.condition = {
@@ -636,11 +677,11 @@ export class ThingsBoardRESTBridge {
         name: alarmType,
         type: alarmType,
         originator: {
-          entityType: 'DEVICE' as const,
-          id: devId,
+          entityType: entity.type,
+          id: entity.id,
         },
         severity: severity.toUpperCase() as any,
-        status: 'ACTIVE_UNACK',
+        status: status as any,
         propagate: true,
         details: ruleDetails,
       };
@@ -746,6 +787,7 @@ export class ThingsBoardRESTBridge {
         from: { id: fromObj.id, entityType: fromObj.type },
         to: { id: toObj.id, entityType: toObj.type },
         type: relationType,
+        typeGroup: 'COMMON',
       };
       await this.relationSrv.createRelation(relation);
       return { status: 'success', message: `Relation '${relationType}' between ${fromName} and ${toName} established.` };
@@ -826,7 +868,7 @@ export class ThingsBoardRESTBridge {
   // Tool 36: create_device_dashboard
   public async createDeviceDashboard(
     deviceName: string, 
-    monitoredKeys: string[] = ['temperature', 'humidity', 'pressure', 'vibration'],
+    monitoredKeys: any = ['temperature', 'humidity', 'pressure', 'vibration'],
     dashboardTitle?: string,
     backgroundColor = '#ffffff'
   ): Promise<any> {
@@ -834,82 +876,65 @@ export class ThingsBoardRESTBridge {
     if (!devId) return { status: 'error', message: 'Device not found' };
 
     try {
+      const keysArray = typeof monitoredKeys === 'string'
+        ? monitoredKeys.split(',').map(k => k.trim())
+        : (Array.isArray(monitoredKeys) ? monitoredKeys : ['temperature', 'humidity', 'pressure', 'vibration']);
+
       const title = dashboardTitle || `${deviceName} Operations Center`;
-      const widgetId = `widget_telemetry_${Date.now()}`;
-      const aliasId = `alias_${deviceName.replace(/\s+/g, '_')}`;
       
-      const configuredDataKeys = monitoredKeys.map((key, i) => {
-        const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
+      const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
+      const configuredDataKeys = keysArray.map((key, i) => {
         return {
           name: key,
           type: 'timeseries',
           label: key.toUpperCase(),
-          color: colors[i % colors.length],
-          settings: {
-            showLines: true,
-            fillLines: true
-          },
-          useUnitFromMetadata: true
+          color: colors[i % colors.length]
         };
       });
 
       const dashboardConfig = {
         title,
         configuration: {
-          widgets: {
-            [widgetId]: {
-              typeFullFqn: "system.charts.timeseries_line_chart",
-              title: `${deviceName} Real-time Telemetry`,
-              sizeX: 16,
-              sizeY: 10,
-              config: {
-                datasources: [
-                  {
-                    type: 'entity',
-                    entityAliasId: aliasId,
-                    dataKeys: configuredDataKeys,
-                  },
-                ],
-                timewindow: {
-                  realtime: { timewindowMs: 3600000 }, // Last 1 hour
-                },
-                showTitle: true,
-                backgroundColor: backgroundColor,
-                color: 'rgba(0, 0, 0, 0.87)',
-                padding: '12px',
-                settings: {
-                  stack: false,
-                  smoothLines: true,
-                  showLegend: true,
-                  shadow: true,
-                },
-              },
-            },
-          },
-          states: {
-            default: {
-              name: title,
-              root: true,
-              layouts: {
-                main: {
-                  widgets: {
-                    [widgetId]: { sizeX: 16, sizeY: 10, row: 0, col: 0 },
-                  },
-                },
-              },
-            },
-          },
+          description: `Auto-generated runtime asset tracking canvas for ${deviceName}`,
           entityAliases: {
-            [aliasId]: {
-              id: aliasId,
-              alias: deviceName,
-              filter: {
-                type: 'singleEntity',
-                singleEntity: { entityType: 'DEVICE', id: devId },
-              },
-            },
+            "alias_device_target": {
+              "id": "alias_device_target",
+              "alias": "Primary Monitored Node",
+              "filter": {
+                "type": "singleEntity",
+                "singleEntity": {
+                  "entityType": "DEVICE",
+                  "id": devId
+                }
+              }
+            }
           },
-        },
+          widgets: [
+            {
+              "isSystemType": true,
+              "bundleAlias": "charts",
+              "typeFullFqn": "charts.timeseries",
+              "title": `${deviceName} Real-Time Metric Stream`,
+              "sizeX": 12,
+              "sizeY": 6,
+              "config": {
+                "datasources": [
+                  {
+                    "type": "entity",
+                    "entityAliasId": "alias_device_target",
+                    "dataKeys": configuredDataKeys
+                  }
+                ],
+                "timewindow": {
+                  "realtime": {
+                    "timewindowMs": 3600000 // 1 hour
+                  }
+                },
+                "backgroundColor": backgroundColor
+              }
+            }
+          ]
+        }
       };
 
       const res = await this.dashboardSrv.saveDashboard(dashboardConfig as any);
@@ -917,7 +942,7 @@ export class ThingsBoardRESTBridge {
         status: 'success',
         dashboardId: res.id?.id,
         title: res.title,
-        monitored_parameters: monitoredKeys,
+        monitored_parameters: keysArray,
         message: `Dashboard created successfully. You can view it in ThingsBoard UI for device ${deviceName}.`,
       };
     } catch (e: any) {
@@ -978,11 +1003,23 @@ export class ThingsBoardRESTBridge {
   }
 
   // Tool 32: send_two_way_rpc
-  public async sendTwoWayRpc(deviceName: string, method: string, params: any): Promise<any> {
+  public async sendTwoWayRpc(deviceName: string, method: string, params: any, timeout?: number): Promise<any> {
     const devId = await this.getDeviceId(deviceName);
     if (!devId) return { status: 'error', message: 'Device not found' };
     try {
-      const response = await this.rpcSrv.sendTwoWayRpc(devId, { method, params });
+      let parsedParams = params;
+      if (typeof params === 'string') {
+        try {
+          parsedParams = JSON.parse(params);
+        } catch {
+          parsedParams = params;
+        }
+      }
+      const requestBody: any = { method, params: parsedParams };
+      if (timeout !== undefined) {
+        requestBody.timeout = timeout;
+      }
+      const response = await this.rpcSrv.sendTwoWayRpc(devId, requestBody);
       return { status: 'success', response };
     } catch (e: any) {
       return { status: 'error', message: e.message };
@@ -1408,6 +1445,236 @@ export class ThingsBoardRESTBridge {
     } catch (err: any) {
       console.error(`[forecastWhatIf] Failed:`, err.message);
       return { error: `Failed to execute forecast what-if: ${err.message}` };
+    }
+  }
+
+  // Tool 4: find_alarms (POST /api/alarmsQuery/find)
+  public async findAlarms(options: {
+    entityType?: EntityType;
+    entityName?: string;
+    pageSize?: number;
+    page?: number;
+    textSearch?: string;
+    severityList?: AlarmSeverity[];
+    statusList?: AlarmStatus[];
+  } = {}): Promise<any> {
+    try {
+      let filter: any = { type: 'entityType', entityType: options.entityType || 'DEVICE' };
+      
+      if (options.entityName) {
+        const entity = await this.resolveEntityIdAndType(options.entityName);
+        if (entity) {
+          filter = {
+            type: 'singleEntity',
+            singleEntity: { entityType: entity.type, id: entity.id }
+          };
+        }
+      }
+
+      const query = {
+        entityFilter: filter,
+        pageLink: {
+          pageSize: options.pageSize || 10,
+          page: options.page || 0,
+          sortOrder: {
+            key: { type: 'ALARM_FIELD', key: 'createdTime' },
+            direction: 'DESC'
+          },
+          textSearch: options.textSearch,
+          severityList: options.severityList,
+          statusList: options.statusList
+        },
+        alarmFields: [
+          { type: 'ALARM_FIELD', key: 'createdTime' },
+          { type: 'ALARM_FIELD', key: 'type' },
+          { type: 'ALARM_FIELD', key: 'severity' },
+          { type: 'ALARM_FIELD', key: 'status' }
+        ],
+        entityFields: [
+          { type: 'ENTITY_FIELD', key: 'name' }
+        ]
+      };
+
+      const result = await this.alarmSrv.findAlarms(query);
+      return result.data || [];
+    } catch (err: any) {
+      console.error('[Tool findAlarms] Query failed:', err.message);
+      return [];
+    }
+  }
+
+  // Tool 41: count_alarms (POST /api/alarmsQuery/count)
+  public async countAlarms(options: {
+    entityType?: EntityType;
+    entityName?: string;
+    severityList?: AlarmSeverity[];
+    statusList?: AlarmStatus[];
+  } = {}): Promise<any> {
+    try {
+      let filter: any = { type: 'entityType', entityType: options.entityType || 'DEVICE' };
+      
+      if (options.entityName) {
+        const entity = await this.resolveEntityIdAndType(options.entityName);
+        if (entity) {
+          filter = {
+            type: 'singleEntity',
+            singleEntity: { entityType: entity.type, id: entity.id }
+          };
+        }
+      }
+
+      const query = {
+        entityFilter: filter,
+        severityList: options.severityList || ['CRITICAL'],
+        statusList: options.statusList || ['ACTIVE'],
+        keyFilters: []
+      };
+
+      const count = await this.alarmSrv.countAlarms(query);
+      return { count };
+    } catch (err: any) {
+      console.error('[Tool countAlarms] Query failed:', err.message);
+      return { count: 0 };
+    }
+  }
+
+  // Tool 6: find_highest_entity_metric (POST /api/entitiesQuery/find)
+  public async findHighestEntityMetric(metric: string, deviceType?: string): Promise<any> {
+    try {
+      const entityFilter = deviceType 
+        ? { type: 'deviceType', deviceTypes: [deviceType], deviceNameFilter: '' }
+        : { type: 'entityType', entityType: 'DEVICE' as const };
+
+      const query = {
+        entityFilter,
+        pageLink: {
+          pageSize: 1,
+          page: 0,
+          sortOrder: {
+            key: { type: 'TIME_SERIES', key: metric },
+            direction: 'DESC'
+          }
+        },
+        entityFields: [
+          { type: 'ENTITY_FIELD', key: 'name' }
+        ],
+        latestValues: [
+          { type: 'TIME_SERIES', key: metric }
+        ],
+        keyFilters: []
+      };
+
+      const res = await this.entityQuerySrv.findEntityData(query);
+      if (res && res.data && res.data.length > 0) {
+        const topEntity = res.data[0];
+        const valObj = topEntity.latest?.TIME_SERIES?.[metric];
+        const val = valObj ? parseFloat(valObj.value) : undefined;
+        return {
+          device: topEntity.name || topEntity.entityId?.id,
+          value: val !== undefined && !isNaN(val) ? val : valObj?.value,
+          metric
+        };
+      }
+    } catch (err: any) {
+      console.warn(`[Tool findHighestEntityMetric] Query failed for metric '${metric}', falling back:`, err.message);
+      return this.getHighestMetric(metric);
+    }
+    return {};
+  }
+
+  // Tool 38: query_entity_data (POST /api/entitiesQuery/find)
+  public async queryEntityData(options: {
+    entityFilter: any;
+    pageLink?: any;
+    entityFields?: any[];
+    latestValues?: any[];
+    keyFilters?: any[];
+  }): Promise<any> {
+    try {
+      const query = {
+        entityFilter: options.entityFilter,
+        pageLink: options.pageLink || {
+          pageSize: 50,
+          page: 0,
+          sortOrder: {
+            key: { type: 'ENTITY_FIELD', key: 'name' },
+            direction: 'ASC'
+          }
+        },
+        entityFields: options.entityFields || [
+          { type: 'ENTITY_FIELD', key: 'name' },
+          { type: 'ENTITY_FIELD', key: 'type' }
+        ],
+        latestValues: options.latestValues || [],
+        keyFilters: options.keyFilters || []
+      };
+
+      const result = await this.entityQuerySrv.findEntityData(query);
+      return result.data || [];
+    } catch (err: any) {
+      console.error('[Tool queryEntityData] Execution failed:', err.message);
+      return [];
+    }
+  }
+
+  // Tool 42: count_entities (POST /api/entitiesQuery/count)
+  public async countEntities(options: {
+    entityFilter: any;
+    keyFilters?: any[];
+  }): Promise<any> {
+    try {
+      const query = {
+        entityFilter: options.entityFilter,
+        keyFilters: options.keyFilters || []
+      };
+      const count = await this.entityQuerySrv.countEntities(query);
+      return { count };
+    } catch (err: any) {
+      console.error('[Tool countEntities] Execution failed:', err.message);
+      return { count: 0 };
+    }
+  }
+
+  // Tool 43: find_available_keys (POST /api/v2/entitiesQuery/find/keys)
+  public async findAvailableKeys(options: {
+    entityFilter: any;
+    includeTimeseries?: boolean;
+    includeAttributes?: boolean;
+  }): Promise<any> {
+    try {
+      const includeTimeseries = options.includeTimeseries !== false;
+      const includeAttributes = options.includeAttributes !== false;
+      const result = await this.entityQuerySrv.findEntityKeys(
+        options.entityFilter,
+        includeTimeseries,
+        includeAttributes
+      );
+      return result || [];
+    } catch (err: any) {
+      console.error('[Tool findAvailableKeys] Execution failed:', err.message);
+      return [];
+    }
+  }
+
+  // Tool 39: get_rule_node_events (GET /api/events/RULE_NODE/{ruleNodeId})
+  public async getRuleNodeEvents(ruleNodeId: string, limit = 10): Promise<any> {
+    try {
+      const events = await this.ruleSrv.getRuleNodeEvents(ruleNodeId, limit);
+      return events;
+    } catch (err: any) {
+      console.error(`[Tool getRuleNodeEvents] Failed for ${ruleNodeId}:`, err.message);
+      return { error: err.message };
+    }
+  }
+
+  // Tool 40: provision_customer_dashboard (POST /api/customer/{customerId}/dashboard/{dashboardId})
+  public async provisionCustomerDashboard(customerId: string, dashboardId: string): Promise<any> {
+    try {
+      const dashboard = await this.dashboardSrv.assignDashboardToCustomer(customerId, dashboardId);
+      return { status: 'success', dashboard };
+    } catch (err: any) {
+      console.error(`[Tool provisionCustomerDashboard] Failed for customer ${customerId} and dashboard ${dashboardId}:`, err.message);
+      return { status: 'error', message: err.message };
     }
   }
 }

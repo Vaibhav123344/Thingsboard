@@ -157,6 +157,14 @@ export class AlarmService {
     existingAlarm.details = { ...existingDetails, ...additionalDetails };
     return this.saveAlarm(existingAlarm);
   }
+
+  public async findAlarms(query: any): Promise<{ data: Alarm[]; [key: string]: any }> {
+    return this.client.request('POST', '/api/alarmsQuery/find', undefined, query);
+  }
+
+  public async countAlarms(query: any): Promise<number> {
+    return this.client.request('POST', '/api/alarmsQuery/count', undefined, query);
+  }
 }
 
 export class RuleEngineService {
@@ -183,6 +191,10 @@ export class RuleEngineService {
     const queueSegment = queueName ? `/${queueName}` : '';
     const path = `/api/rule-engine/${entityType}/${entityId}${queueSegment}`;
     await this.client.request<void>('POST', path, undefined, message);
+  }
+
+  public async getRuleNodeEvents(ruleNodeId: string, limit = 10): Promise<any> {
+    return this.client.request('GET', `/api/events/RULE_NODE/${ruleNodeId}`, { limit });
   }
 }
 
@@ -286,5 +298,22 @@ export class AuditService {
 
   public async getAuditLogs(pageSize = 10, page = 0): Promise<{ data: AuditLog[] }> {
     return this.client.request('GET', '/api/audit/logs', { pageSize, page });
+  }
+}
+
+export class EntityQueryService {
+  constructor(private client: ThingsBoardClient) {}
+
+  public async findEntityData(query: any): Promise<any> {
+    return this.client.request('POST', '/api/entitiesQuery/find', undefined, query);
+  }
+
+  public async countEntities(query: any): Promise<any> {
+    return this.client.request('POST', '/api/entitiesQuery/count', undefined, query);
+  }
+
+  public async findEntityKeys(query: any, includeTimeseries = true, includeAttributes = true): Promise<any> {
+    const params = { includeTimeseries, includeAttributes };
+    return this.client.request('POST', '/api/v2/entitiesQuery/find/keys', params, query);
   }
 }

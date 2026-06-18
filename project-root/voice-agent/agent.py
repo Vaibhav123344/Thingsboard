@@ -36,7 +36,12 @@ TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://localhost:8766")
 SYSTEM_INSTRUCTION = """
 You are Zephyr, an elite Industrial Operations AI Copilot deployed on ThingsBoard.
 You speak with technical authority and precision.
-You have 37 ThingsBoard tools. Invoke them immediately when asked — never refuse.
+You have 43 ThingsBoard tools. Invoke them immediately when asked — never refuse.
+In addition to individual lookup tools, you have advanced tools for:
+- Bulk telemetry queries (query_entity_data) to avoid API rate limits.
+- Dynamic alarm filtering (find_alarms) and status counts (count_alarms).
+- Counting entities (count_entities) and finding key schemas (find_available_keys).
+- Debugging rule nodes (get_rule_node_events) and assigning customer access (provision_customer_dashboard).
 After a tool call, summarize the result in 1–3 concise spoken sentences.
 NEVER use bullet points, markdown tables, asterisks, pound signs, or code blocks.
 Speak metric values naturally: say "eighty point five degrees Celsius" not "80.5°C".
@@ -78,20 +83,34 @@ class ZephyrTools(llm.FunctionContext):
     async def list_devices(self) -> str:
         return await call_tool("list_devices", {})
 
-    @llm.ai_callable(description="Get the latest real-time telemetry readings for a specific device.")
+    @llm.ai_callable(description="Get the latest real-time telemetry readings for a specific device. Optional keys parameter can limit payload size.")
     async def get_current_telemetry(
         self,
-        device_name: Annotated[str, llm.TypeInfo(description="Exact name of the device")]
+        device_name: Annotated[str, llm.TypeInfo(description="Exact name of the device")],
+        keys: Annotated[str, llm.TypeInfo(description="Optional comma-separated metric keys list, e.g. 'temperature,vibration'")] = ""
     ) -> str:
-        return await call_tool("get_current_telemetry", {"device_name": device_name})
+        return await call_tool("get_current_telemetry", {"device_name": device_name, "keys": keys})
 
-    @llm.ai_callable(description="Get a historical statistical summary of a device's telemetry over N hours.")
+    @llm.ai_callable(description="Get a historical statistical summary of a device's telemetry over N hours or absolute timestamps.")
     async def get_historical_summary(
         self,
         device_name: Annotated[str, llm.TypeInfo(description="Name of the device")],
-        hours: Annotated[int, llm.TypeInfo(description="Number of hours to look back (e.g. 24, 48, 168 for a week)")]
+        hours: Annotated[int, llm.TypeInfo(description="Number of hours to look back (e.g. 24, 48)")] = 1,
+        keys: Annotated[str, llm.TypeInfo(description="Optional comma-separated metric keys list")] = "",
+        start_ts: Annotated[int, llm.TypeInfo(description="Optional absolute start Epoch milliseconds timestamp")] = 0,
+        end_ts: Annotated[int, llm.TypeInfo(description="Optional absolute end Epoch milliseconds timestamp")] = 0,
+        agg: Annotated[str, llm.TypeInfo(description="Optional aggregation function: NONE, AVG, MIN, MAX, SUM, COUNT")] = "NONE",
+        interval: Annotated[int, llm.TypeInfo(description="Optional aggregation interval in milliseconds")] = 0
     ) -> str:
-        return await call_tool("get_historical_summary", {"device_name": device_name, "hours": hours})
+        return await call_tool("get_historical_summary", {
+            "device_name": device_name,
+            "hours": hours,
+            "keys": keys,
+            "startTs": start_ts if start_ts > 0 else None,
+            "endTs": end_ts if end_ts > 0 else None,
+            "agg": agg,
+            "interval": interval if interval > 0 else None
+        })
 
     @llm.ai_callable(description="Get all currently active alarms and alerts across all devices.")
     async def get_active_alarms(self) -> str:
@@ -191,16 +210,17 @@ class ZephyrTools(llm.FunctionContext):
     ) -> str:
         return await call_tool("trigger_rule_engine", {"device_name": device_name, "message": message})
 
-    @llm.ai_callable(description="Create a new alarm on a device with a specified severity level and threshold condition.")
+    @llm.ai_callable(description="Create a new alarm on a device or asset with a specified severity level and condition.")
     async def create_alarm(
         self,
-        device_name:        Annotated[str,   llm.TypeInfo(description="Name of the device")],
-        alarm_type:         Annotated[str,   llm.TypeInfo(description="Alarm identifier name (e.g. 'HIGH_TEMPERATURE', 'OVERPRESSURE')")],
-        severity:           Annotated[str,   llm.TypeInfo(description="Alarm severity: CRITICAL, MAJOR, MINOR, WARNING, or INDETERMINATE")],
-        details:            Annotated[str,   llm.TypeInfo(description="Human-readable description of the alarm")]  = "",
-        metric_param:       Annotated[str,   llm.TypeInfo(description="Metric key that triggered this alarm")]     = "",
-        operator_condition: Annotated[str,   llm.TypeInfo(description="Comparison operator: GREATER_THAN, LESS_THAN, EQUAL")]  = "",
-        comparison_value:   Annotated[float, llm.TypeInfo(description="Numeric threshold value for the condition")] = 0.0,
+        device_name:        Annotated[str,   llm.TypeInfo(description="Name of the device or asset")],
+        alarm_type:         Annotated[str,   llm.TypeInfo(description="Alarm type identifier (e.g. 'HIGH_TEMPERATURE')")],
+        severity:           Annotated[str,   llm.TypeInfo(description="Alarm severity: CRITICAL, MAJOR, MINOR, WARNING, INDETERMINATE")],
+        details:            Annotated[str,   llm.TypeInfo(description="Description of the alarm")] = "",
+        metric_param:       Annotated[str,   llm.TypeInfo(description="Metric key that triggered this alarm")] = "",
+        operator_condition: Annotated[str,   llm.TypeInfo(description="Comparison operator: GREATER_THAN, LESS_THAN, EQUAL")] = "",
+        comparison_value:   Annotated[float, llm.TypeInfo(description="Numeric threshold value")] = 0.0,
+        status:             Annotated[str,   llm.TypeInfo(description="Initial alarm status: ACTIVE_UNACK, ACTIVE_ACK")] = "ACTIVE_UNACK"
     ) -> str:
         return await call_tool("create_alarm", {
             "device_name":        device_name,
@@ -210,6 +230,7 @@ class ZephyrTools(llm.FunctionContext):
             "metric_param":       metric_param,
             "operator_condition": operator_condition,
             "comparison_value":   comparison_value,
+            "status":             status
         })
 
     # ══ 16–17: Rule Engine ════════════════════════════════════════════════════
@@ -411,11 +432,13 @@ class ZephyrTools(llm.FunctionContext):
         device_name: Annotated[str, llm.TypeInfo(description="Name of the target device")],
         method:      Annotated[str, llm.TypeInfo(description="RPC method name")],
         params:      Annotated[str, llm.TypeInfo(description="JSON string of method parameters")] = "{}",
+        timeout:     Annotated[int, llm.TypeInfo(description="Optional execution timeout in milliseconds")] = 0
     ) -> str:
         return await call_tool("send_two_way_rpc", {
             "device_name": device_name,
             "method": method,
             "params": params,
+            "timeout": timeout if timeout > 0 else None
         })
 
     @llm.ai_callable(description="List all pending persistent RPC commands queued for a specific device.")
@@ -444,6 +467,128 @@ class ZephyrTools(llm.FunctionContext):
             "metric":         metric,
             "forecast_hours": forecast_hours,
             "scenario":       scenario,
+        })
+
+    # ══Refactored and Expansion Tools ═════════════════════════════════════════
+
+    @llm.ai_callable(description="Search and filter active or cleared alarms dynamically by entity, severity, status, or text search.")
+    async def find_alarms(
+        self,
+        entity_type: Annotated[str, llm.TypeInfo(description="Optional filter by entity type: DEVICE, ASSET")] = "DEVICE",
+        entity_name: Annotated[str, llm.TypeInfo(description="Optional filter by specific entity name")] = "",
+        page_size: Annotated[int, llm.TypeInfo(description="Number of alarms to fetch (default: 10)")] = 10,
+        page: Annotated[int, llm.TypeInfo(description="Page number (default: 0)")] = 0,
+        text_search: Annotated[str, llm.TypeInfo(description="Optional text filter")] = "",
+        severity_list: Annotated[str, llm.TypeInfo(description="Optional comma-separated severities, e.g. 'CRITICAL,MAJOR'")] = "",
+        status_list: Annotated[str, llm.TypeInfo(description="Optional comma-separated statuses, e.g. 'ACTIVE_UNACK,ACTIVE_ACK'")] = ""
+    ) -> str:
+        sevs = [s.strip().upper() for s in severity_list.split(',') if s.strip()] if severity_list else None
+        stats = [s.strip().upper() for s in status_list.split(',') if s.strip()] if status_list else None
+        return await call_tool("find_alarms", {
+            "entityType": entity_type,
+            "entityName": entity_name if entity_name else None,
+            "pageSize": page_size,
+            "page": page,
+            "textSearch": text_search if text_search else None,
+            "severityList": sevs,
+            "statusList": stats
+        })
+
+    @llm.ai_callable(description="Count active alarms on devices or assets.")
+    async def count_alarms(
+        self,
+        entity_type: Annotated[str, llm.TypeInfo(description="Optional entity type: DEVICE, ASSET")] = "DEVICE",
+        entity_name: Annotated[str, llm.TypeInfo(description="Optional entity name")] = "",
+        severity_list: Annotated[str, llm.TypeInfo(description="Optional comma-separated severities (default: 'CRITICAL')")] = "CRITICAL",
+        status_list: Annotated[str, llm.TypeInfo(description="Optional comma-separated statuses (default: 'ACTIVE_UNACK,ACTIVE_ACK')")] = "ACTIVE_UNACK,ACTIVE_ACK"
+    ) -> str:
+        sevs = [s.strip().upper() for s in severity_list.split(',') if s.strip()] if severity_list else ['CRITICAL']
+        stats = [s.strip().upper() for s in status_list.split(',') if s.strip()] if status_list else ['ACTIVE_UNACK', 'ACTIVE_ACK']
+        return await call_tool("count_alarms", {
+            "entityType": entity_type,
+            "entityName": entity_name if entity_name else None,
+            "severityList": sevs,
+            "statusList": stats
+        })
+
+    @llm.ai_callable(description="Find which device or asset currently has the highest value for a specific metric key.")
+    async def find_highest_entity_metric(
+        self,
+        metric: Annotated[str, llm.TypeInfo(description="Metric key to compare (e.g. 'temperature', 'vibration')")],
+        device_type: Annotated[str, llm.TypeInfo(description="Optional device type to filter, e.g. 'industrial_sensor'")] = ""
+    ) -> str:
+        return await call_tool("find_highest_entity_metric", {
+            "metric": metric,
+            "device_type": device_type if device_type else None
+        })
+
+    @llm.ai_callable(description="Bulk fetch telemetry and attribute data using filter rules, page constraints, and predicates.")
+    async def query_entity_data(
+        self,
+        query_json: Annotated[str, llm.TypeInfo(description="Full JSON query structure including entityFilter, latestValues, pageLink, keyFilters")]
+    ) -> str:
+        import json
+        try:
+            payload = json.loads(query_json)
+        except Exception as e:
+            return f"Invalid JSON format for query: {e}"
+        return await call_tool("query_entity_data", payload)
+
+    @llm.ai_callable(description="Count devices or assets matching attribute or telemetry filters.")
+    async def count_entities(
+        self,
+        entity_filter_json: Annotated[str, llm.TypeInfo(description="JSON structure of entityFilter")],
+        key_filters_json: Annotated[str, llm.TypeInfo(description="JSON array string of keyFilters (optional)")] = "[]"
+    ) -> str:
+        import json
+        try:
+            ef = json.loads(entity_filter_json)
+            kf = json.loads(key_filters_json)
+        except Exception as e:
+            return f"Invalid JSON format: {e}"
+        return await call_tool("count_entities", {
+            "entityFilter": ef,
+            "keyFilters": kf
+        })
+
+    @llm.ai_callable(description="Retrieve all telemetry and attribute keys currently saved on entities matching a filter.")
+    async def find_available_keys(
+        self,
+        entity_filter_json: Annotated[str, llm.TypeInfo(description="JSON structure of entityFilter")],
+        include_timeseries: Annotated[bool, llm.TypeInfo(description="Include timeseries keys")] = True,
+        include_attributes: Annotated[bool, llm.TypeInfo(description="Include attribute keys")] = True
+    ) -> str:
+        import json
+        try:
+            ef = json.loads(entity_filter_json)
+        except Exception as e:
+            return f"Invalid JSON format: {e}"
+        return await call_tool("find_available_keys", {
+            "entityFilter": ef,
+            "includeTimeseries": include_timeseries,
+            "includeAttributes": include_attributes
+        })
+
+    @llm.ai_callable(description="Retrieve real-time event logs and diagnostics from a custom rule node to debug rule chains.")
+    async def get_rule_node_events(
+        self,
+        rule_node_id: Annotated[str, llm.TypeInfo(description="UUID of the rule node")],
+        limit: Annotated[int, llm.TypeInfo(description="Max event logs to fetch (default: 10)")] = 10
+    ) -> str:
+        return await call_tool("get_rule_node_events", {
+            "ruleNodeId": rule_node_id,
+            "limit": limit
+        })
+
+    @llm.ai_callable(description="Assign access and visibility rights for a dashboard to a designated customer tenant.")
+    async def provision_customer_dashboard(
+        self,
+        customer_id: Annotated[str, llm.TypeInfo(description="UUID of the customer")],
+        dashboard_id: Annotated[str, llm.TypeInfo(description="UUID of the dashboard")]
+    ) -> str:
+        return await call_tool("provision_customer_dashboard", {
+            "customerId": customer_id,
+            "dashboardId": dashboard_id
         })
 
 
