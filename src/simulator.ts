@@ -4,9 +4,10 @@ import * as mqtt from 'mqtt';
 import * as http from 'http';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import { WebSocketServer, WebSocket } from 'ws';
 import { ThingsBoardClient } from './restClient';
 import { ThingsBoardRESTBridge } from './bridge';
-import { livekitRouter, toolsRouter } from './livekitRoutes';
+import { toolsRouter } from './toolsRoutes';
 
 dotenv.config();
 
@@ -261,15 +262,12 @@ export async function startSimulatorAPI() {
     }
   });
 
-  // Inside startSimulatorAPI(), below app.use(express.json());
-  app.use('/api/livekit', livekitRouter);
   app.use('/api/tools', toolsRouter);
 
-  // Re-write the server creation entirely to just HTTP
   const server = http.createServer(app);
+
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Stable Ingestion Layer Simulation listening on port ${PORT}`);
-    console.log(`LiveKit Token & Tool Gateway mounted successfully.`);
   });
 }
 

@@ -892,6 +892,8 @@ export class ThingsBoardRESTBridge {
         };
       });
 
+      const widgetId = 'w' + Math.floor(Math.random() * 1000000);
+
       const dashboardConfig = {
         title,
         configuration: {
@@ -909,14 +911,12 @@ export class ThingsBoardRESTBridge {
               }
             }
           },
-          widgets: [
-            {
+          widgets: {
+            [widgetId]: {
               "isSystemType": true,
               "bundleAlias": "charts",
-              "typeFullFqn": "charts.timeseries",
+              "typeFullFqn": "system.charts.timeseries_line_chart",
               "title": `${deviceName} Real-Time Metric Stream`,
-              "sizeX": 12,
-              "sizeY": 6,
               "config": {
                 "datasources": [
                   {
@@ -933,7 +933,26 @@ export class ThingsBoardRESTBridge {
                 "backgroundColor": backgroundColor
               }
             }
-          ]
+          },
+          layouts: {
+            "main": {
+              "widgets": {
+                [widgetId]: {
+                  "sizeX": 24,
+                  "sizeY": 10,
+                  "row": 0,
+                  "col": 0
+                }
+              },
+              "gridSettings": {
+                "backgroundColor": "#eeeeee",
+                "color": "rgba(0,0,0,0.87)",
+                "columns": 24,
+                "margin": 10,
+                "backgroundSizeMode": "100%"
+              }
+            }
+          }
         }
       };
 

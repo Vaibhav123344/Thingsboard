@@ -1,39 +1,20 @@
 // frontend/src/App.tsx
 import { useState, useEffect, useCallback } from 'react';
 import { 
-  LiveKitRoom,
-  RoomAudioRenderer,
-  useLocalParticipant,
-} from '@livekit/components-react';
-import { 
   Mic, MicOff, Send, AlertTriangle, 
   Terminal, Radio, Play, Square,
   Activity, Layers, ChevronRight, Bell, RefreshCw, Cpu,
   Search, Check, Database, Settings, Key
 } from 'lucide-react';
 import { DeviceInfo, AlarmLog, TerminalLog } from './types';
+import { LiveKitIntegration } from './LiveKitWrapper';
 
 // Physical constants for UI safety flagging
 const TEMP_THRESHOLD = 80.0;
 const VIB_THRESHOLD = 4.0;
 
-const LIVEKIT_SERVER = 'ws://localhost:7880';
-const TOKEN_ENDPOINT = 'http://localhost:9005/api/livekit/token';
-
-async function fetchRoomToken(room: string): Promise<string> {
-  const identity = `operator-${Date.now()}`;
-  const url = `${TOKEN_ENDPOINT}?room=${encodeURIComponent(room)}&identity=${identity}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Token fetch failed: ${res.statusText}`);
-  const data = await res.json();
-  return data.token;
-}
-
 export default function App() {
-  const [roomToken, setRoomToken] = useState<string | null>(null);
-  const [livekitConnected, setLivekitConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  
+
   // Real-time Dashboard variables
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [alarms, setAlarms] = useState<AlarmLog[]>([]);
@@ -42,7 +23,7 @@ export default function App() {
   const [predictionReport, setPredictionReport] = useState<any>(null);
 
   // Tabs navigation
-  const [activeTab, setActiveTab] = useState<'telemetry' | 'alarms' | 'diagnostics' | 'entities'>('telemetry');
+  const [activeTab, setActiveTab] = useState<'telemetry' | 'alarms'>('telemetry');
 
   // Alarm Counts state
   const [criticalCount, setCriticalCount] = useState<number>(0);
@@ -56,26 +37,6 @@ export default function App() {
   const [alarmPage, setAlarmPage] = useState<number>(0);
   const [isAlarmsLoading, setIsAlarmsLoading] = useState<boolean>(false);
 
-  // Rule Node Diagnostics State
-  const [diagnosticRuleNodeId, setDiagnosticRuleNodeId] = useState<string>('');
-  const [ruleNodeLogs, setRuleNodeLogs] = useState<any[]>([]);
-  const [isLoadingRuleLogs, setIsLoadingRuleLogs] = useState<boolean>(false);
-
-  // Entity Hub State
-  const [entityQueryFilter, setEntityQueryFilter] = useState<string>(
-    JSON.stringify({ type: 'entityType', entityType: 'DEVICE' }, null, 2)
-  );
-  const [entityCountResult, setEntityCountResult] = useState<number | null>(null);
-  const [availableKeysResult, setAvailableKeysResult] = useState<{
-    CLIENT_ATTRIBUTE?: string[];
-    SHARED_ATTRIBUTE?: string[];
-    SERVER_ATTRIBUTE?: string[];
-    TIME_SERIES?: string[];
-  } | null>(null);
-  const [provisionCustomerId, setProvisionCustomerId] = useState<string>('');
-  const [provisionDashboardId, setProvisionDashboardId] = useState<string>('');
-  const [provisionStatusMsg, setProvisionStatusMsg] = useState<{ type: 'success' | 'error', text: string } | null>(null);
-  const [isProvisioning, setIsProvisioning] = useState<boolean>(false);
 
   // Chat and transcription outputs
   const [userInput, setUserInput] = useState('');
@@ -217,30 +178,11 @@ export default function App() {
     ]);
   };
 
-  const handleToggleLiveMode = useCallback(async (activate: boolean) => {
-    if (activate) {
-      setIsConnecting(true);
-      try {
-        const token = await fetchRoomToken('zephyr-operational-room');
-        setRoomToken(token);
-        setLivekitConnected(true);
-        addLog('status', 'Neural link established with Zephyr Gateway via LiveKit.');
-      } catch (err) {
-        console.error('Could not obtain LiveKit token:', err);
-        addLog('error', 'Failed to connect to LiveKit Gateway.');
-      } finally {
-        setIsConnecting(false);
-      }
-    } else {
-      setRoomToken(null);
-      setLivekitConnected(false);
-      addLog('status', 'LiveKit Gateway disconnected.');
-    }
-  }, []);
 
   const handleSendPrompt = () => {
     if (!userInput.trim()) return;
     addLog('user', userInput);
+    // Deprecated for now, text command logic can be sent via REST if needed.
     setUserInput('');
   };
 
@@ -421,14 +363,13 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', fontWeight: 700 }}>
           <div style={{ 
             width: '8px', height: '8px', borderRadius: '50%', 
-            background: livekitConnected ? '#10b981' : isConnecting ? '#fbbf24' : '#ef4444', 
-            boxShadow: livekitConnected ? '0 0 8px #10b981' : isConnecting ? '0 0 8px #fbbf24' : 'none' 
+            background: '#10b981', 
+            boxShadow: '0 0 8px #10b981'
           }}></div>
           <span style={{ color: '#475569' }}>
-            SYSTEM {livekitConnected ? 'READY' : isConnecting ? 'CONNECTING' : 'OFFLINE'}
+            SYSTEM READY
           </span>
-        </div>
-        
+        </div>        
         <button 
           onClick={toggleSimulation}
           style={{
@@ -1078,7 +1019,7 @@ export default function App() {
       
       {/* Workspace Tab Navigation */}
       <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', gap: '8px', paddingBottom: '2px' }}>
-        {(['telemetry', 'alarms', 'diagnostics', 'entities'] as const).map((tab) => (
+        {(['telemetry', 'alarms'] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -1096,10 +1037,7 @@ export default function App() {
               letterSpacing: '0.5px',
             }}
           >
-            {tab === 'telemetry' ? 'Telemetry Stream' :
-             tab === 'alarms' ? 'Alarms Explorer' :
-             tab === 'diagnostics' ? 'Rule Node Debug' :
-             'Entity Hub'}
+            {tab === 'telemetry' ? 'Telemetry Stream' : 'Alarms Explorer'}
           </button>
         ))}
       </div>
@@ -1116,51 +1054,9 @@ export default function App() {
             <Activity size={20} style={{ color: '#38bdf8' }} />
             <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: '#f8fafc', letterSpacing: '0.5px' }}>ZEPHYR NEURAL LINK</h3>
           </div>
-          <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 700 }}>AI STATUS: <span style={{ color: '#38bdf8' }}>{livekitConnected ? 'ONLINE' : 'STANDBY'}</span></div>
-        </div>
-
-        <div style={{ display: 'flex', gap: '20px', alignItems: 'center' }}>
-          <div 
-            style={{
-              width: '72px', height: '72px', borderRadius: '50%', border: 'none',
-              background: livekitConnected ? '#ef4444' : '#38bdf8',
-              color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              boxShadow: livekitConnected ? '0 0 20px rgba(239, 68, 68, 0.4)' : '0 0 20px rgba(56, 189, 248, 0.4)',
-              transition: 'all 0.3s'
-            }}
-          >
-            {livekitConnected ? <Mic size={32} /> : <MicOff size={32} />}
-          </div>
-
-          <div style={{ flex: 1, position: 'relative' }}>
-            <input 
-              type="text"
-              value={userInput}
-              onChange={(e) => setUserInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSendPrompt()}
-              placeholder="Type a manual command..."
-              style={{
-                width: '100%', padding: '16px 56px 16px 24px', borderRadius: '16px',
-                background: 'rgba(30, 41, 59, 0.5)', border: '1px solid #334155',
-                color: '#fff', fontSize: '15px', outline: 'none'
-              }}
-            />
-            <button 
-              onClick={handleSendPrompt}
-              style={{ position: 'absolute', right: '16px', top: '50%', transform: 'translateY(-50%)', background: 'transparent', border: 'none', cursor: 'pointer', color: '#38bdf8' }}
-            >
-              <Send size={20} />
-            </button>
-          </div>
         </div>
         
-        <div style={{ textAlign: 'center' }}>
-          {livekitConnected ? (
-            <div style={{ fontSize: '11px', color: '#ef4444', fontWeight: 800, letterSpacing: '2px' }} className="blink">● LIVE RECORDING ACTIVE</div>
-          ) : (
-            <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600 }}>USE THE FLOATING MICROPHONE BUTTON TO CONNECT</div>
-          )}
-        </div>
+        <LiveKitIntegration />
       </div>
     </section>
   );
@@ -1198,41 +1094,9 @@ export default function App() {
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#fff', color: '#1e293b', overflow: 'hidden' }}>
       {renderNavbar()}
 
-      {livekitConnected && roomToken ? (
-        <LiveKitRoom
-          video={false}
-          audio={true}
-          token={roomToken}
-          serverUrl={LIVEKIT_SERVER}
-          onConnected={() => addLog('status', '[LiveKit] Joined operational room')}
-          onDisconnected={() => {
-            addLog('status', '[LiveKit] Disconnected');
-            setLivekitConnected(false);
-            setRoomToken(null);
-          }}
-          onError={(err) => addLog('error', `[LiveKit] Error: ${err.message}`)}
-          options={{
-            audioCaptureDefaults: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            }
-          }}
-        >
-          <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-            {commonLayout}
-          </div>
-
-          {/* Core components for S2S architecture */}
-          <RoomAudioRenderer />
-          <MicController onToggle={handleToggleLiveMode} isActive={livekitConnected} />
-        </LiveKitRoom>
-      ) : (
-        <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-          {commonLayout}
-          <MicController onToggle={handleToggleLiveMode} isActive={false} />
-        </div>
-      )}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        {commonLayout}
+      </div>
 
       <style>{`
         .glow-active { animation: glow 2s infinite ease-in-out; }
@@ -1253,48 +1117,5 @@ export default function App() {
         }
       `}</style>
     </div>
-  );
-}
-
-function MicController({
-  onToggle,
-  isActive,
-}: {
-  onToggle: (active: boolean) => void;
-  isActive: boolean;
-}) {
-  const { localParticipant } = useLocalParticipant();
-
-  const handleClick = async () => {
-    if (isActive) {
-      await localParticipant?.setMicrophoneEnabled(false);
-      onToggle(false);
-    } else {
-      onToggle(true);
-    }
-  };
-
-  return (
-    <button
-      onClick={handleClick}
-      style={{
-        position: 'fixed',
-        bottom: 24,
-        right: 24,
-        width: 64,
-        height: 64,
-        borderRadius: '50%',
-        background: isActive ? '#ef4444' : '#38bdf8',
-        border: 'none',
-        cursor: 'pointer',
-        fontSize: 24,
-        boxShadow: isActive ? '0 0 16px rgba(239,68,68,0.6)' : '0 4px 12px rgba(0,0,0,0.3)',
-        transition: 'all 0.2s ease',
-        zIndex: 1000
-      }}
-      title={isActive ? 'Stop Live Mode' : 'Start Live Mode'}
-    >
-      {isActive ? '🔴' : '🎙️'}
-    </button>
   );
 }

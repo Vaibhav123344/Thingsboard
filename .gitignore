@@ -1,2 +1,39 @@
-.env 
-.env 
+# Environments
+.env
+.env.*
+!.env.example
+.venv/
+env/
+venv/
+ENV/
+
+# Node.js
+node_modules/
+dist/
+build/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Models and Large Files
+*.onnx
+*.bin
+*.pt
+*.pth
+voice_agent/stt/faster-whisper*/
+livekit-server.exe
+*.exe
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
